@@ -2,9 +2,6 @@
 // Zoos Global — Microsoft DNS Monitor for Datadog
 // https://www.zoosglobal.com
 //
-// WMI query helpers. All DNS statistics, process info, and service
-// state are read via WMI — no PowerShell subprocess needed.
-//
 //go:build windows
 // +build windows
 
@@ -16,7 +13,7 @@ import (
 	"github.com/StackExchange/wmi"
 )
 
-// queryWMI executes a WQL query and populates dst (must be a pointer to a slice of structs).
+// queryWMI executes a WQL query and populates dst.
 func queryWMI(query string, dst interface{}) error {
 	if err := wmi.Query(query, dst); err != nil {
 		return fmt.Errorf("WMI query %q: %w", query, err)
@@ -40,7 +37,7 @@ type Win32_PerfFormattedData_DNS_DNSServer struct {
 	RecursiveQueries            uint64
 	RecursiveQueryFailure       uint64
 	RecursiveTimeOut            uint64
-	CacheHits                   uint64 // may be zero on older OS
+	CacheHits                   uint64
 	DynamicUpdateReceived       uint64
 	SecureUpdateReceived        uint64
 	ZoneTransferRequestReceived uint64
@@ -51,15 +48,18 @@ type Win32_PerfFormattedData_DNS_DNSServer struct {
 	UnmatchedResponsesReceived  uint64
 }
 
-// Win32_Process — DNS process metrics.
+// Win32_Process — DNS process metrics including creation time for uptime
+// and PrivatePageCount for private memory (distinct from working set).
 type Win32_Process struct {
-	Name             string
-	WorkingSetSize   uint64
-	VirtualSize      uint64
-	ThreadCount      uint32
-	HandleCount      uint32
+	Name                string
+	WorkingSetSize      uint64
+	VirtualSize         uint64
+	PrivatePageCount    uint64 // private committed memory — catches memory leaks
+	ThreadCount         uint32
+	HandleCount         uint32
 	ReadOperationCount  uint64
 	WriteOperationCount uint64
+	CreationDate        string // WMI datetime string — used to compute uptime
 }
 
 // Win32_PerfFormattedData_PerfProc_Process — per-process CPU.
