@@ -7,6 +7,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write   # 🔥 REQUIRED
+
 jobs:
   release:
     name: Build and publish release
@@ -42,9 +45,11 @@ jobs:
           cd dist
           zip dns-monitor-${VERSION}-windows-amd64.zip dns-monitor.exe
 
-      - name: Upload release assets
+      - name: Create GitHub Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.ref_name }}
+          name: Release ${{ github.ref_name }}
           files: |
             dist/dns-monitor.exe
             dist/dns-monitor-${{ env.VERSION }}-windows-amd64.zip
