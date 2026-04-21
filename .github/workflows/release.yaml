@@ -1,18 +1,4 @@
 # .github/workflows/release.yaml
-# Zoos Global — Microsoft DNS Monitor for Datadog
-# https://www.zoosglobal.com
-#
-# Triggered on: git tag push matching v*  (e.g. v1.0.0, v1.2.3)
-#
-# What it does:
-#   1. Cross-compiles dns-monitor.exe for windows/amd64
-#   2. Packages everything a customer needs into a single zip
-#   3. Publishes the zip to GitHub Releases as a downloadable asset
-#   4. Auto-generates release notes from CHANGELOG.md
-#
-# Customer download experience:
-#   https://github.com/ZoosGlobal/datadog-dns-integration/releases/latest
-#   → datadog-dns-integration-v1.0.0-windows-amd64.zip
 
 name: Release
 
@@ -21,147 +7,44 @@ on:
     tags:
       - 'v*'
 
-permissions:
-  contents: write   # needed to create GitHub Release and upload assets
-
 jobs:
   release:
-    name: Build and release
+    name: Build and publish release
     runs-on: ubuntu-latest
 
     steps:
-
-      # ── 1. Checkout ────────────────────────────────────────────────────────
-      - name: Checkout source
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # full history needed for changelog extraction
 
-      # ── 2. Set up Go ───────────────────────────────────────────────────────
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-          cache: true
 
-      # ── 3. Extract version from tag ────────────────────────────────────────
-      - name: Extract version
-        id: version
-        run: |
-          VERSION="${GITHUB_REF_NAME}"           # e.g. v1.0.0
-          VERSION_BARE="${VERSION#v}"            # e.g. 1.0.0
-          echo "version=${VERSION}"         >> "$GITHUB_OUTPUT"
-          echo "version_bare=${VERSION_BARE}" >> "$GITHUB_OUTPUT"
-          echo "asset_name=datadog-dns-integration-${VERSION}-windows-amd64" >> "$GITHUB_OUTPUT"
+      - name: Extract version from tag
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
 
-      # ── 4. Download Go dependencies ────────────────────────────────────────
-      - name: Download dependencies
-        run: go mod download
-
-      # ── 5. Run go vet (windows target) ─────────────────────────────────────
-      - name: Vet
-        run: GOOS=windows GOARCH=amd64 go vet ./...
-
-      # ── 6. Cross-compile dns-monitor.exe ───────────────────────────────────
-      - name: Build dns-monitor.exe
+      - name: Build binary
         env:
-          GOOS:   windows
+          GOOS: windows
           GOARCH: amd64
-          CGO_ENABLED: "0"
+          CGO_ENABLED: 0
         run: |
           mkdir -p dist
           go build \
-            -ldflags "-s -w -X main.version=${{ steps.version.outputs.version_bare }}" \
+            -ldflags "-s -w -X main.version=${VERSION}" \
             -o dist/dns-monitor.exe \
-            ./...
-          echo "Built: $(ls -lh dist/dns-monitor.exe)"
+            .
+          ls -lh dist/dns-monitor.exe
 
-      # ── 7. Package release zip ─────────────────────────────────────────────
-      #
-      #  The zip contains everything a customer needs to deploy:
-      #
-      #  datadog-dns-integration-v1.0.0-windows-amd64/
-      #  ├── dns-monitor.exe                   ← the binary
-      #  ├── dns-monitor-config.yaml.example   ← binary config template
-      #  ├── checks.d/
-      #  │   └── dns_monitor.py                ← Agent check wrapper
-      #  ├── conf.d/
-      #  │   └── dns_monitor.d/
-      #  │       └── conf.yaml                 ← Agent check config
-      #  ├── scripts/
-      #  │   └── setup.ps1                     ← one-click installer
-      #  ├── README.md
-      #  └── CHANGELOG.md
-      #
-      - name: Package release zip
+      - name: Package release
         run: |
-          ASSET="${{ steps.version.outputs.asset_name }}"
-          mkdir -p "release/${ASSET}/checks.d"
-          mkdir -p "release/${ASSET}/conf.d/dns_monitor.d"
-          mkdir -p "release/${ASSET}/scripts"
+          cd dist
+          zip dns-monitor-${VERSION}-windows-amd64.zip dns-monitor.exe
 
-          # Binary
-          cp dist/dns-monitor.exe                      "release/${ASSET}/"
-
-          # Config template
-          cp dns-monitor-config.yaml.example           "release/${ASSET}/"
-
-          # Agent check files
-          cp checks.d/dns_monitor.py                   "release/${ASSET}/checks.d/"
-          cp conf.d/dns_monitor.d/conf.yaml            "release/${ASSET}/conf.d/dns_monitor.d/"
-
-          # Installer
-          cp scripts/setup.ps1                         "release/${ASSET}/scripts/"
-
-          # Docs
-          cp README.md   "release/${ASSET}/"
-          cp CHANGELOG.md "release/${ASSET}/"
-
-          # Create zip
-          cd release
-          zip -r "${ASSET}.zip" "${ASSET}/"
-          echo "Package: $(ls -lh ${ASSET}.zip)"
-
-          # Generate SHA256 checksum
-          sha256sum "${ASSET}.zip" > "${ASSET}.zip.sha256"
-          cat "${ASSET}.zip.sha256"
-
-      # ── 8. Extract release notes from CHANGELOG.md ─────────────────────────
-      - name: Extract release notes
-        id: changelog
-        run: |
-          VERSION="${{ steps.version.outputs.version_bare }}"
-          # Extract section for this version from CHANGELOG.md
-          # Looks for ## [1.0.0] and captures until the next ## [
-          NOTES=$(awk "/^## \[${VERSION}\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md)
-          if [ -z "$NOTES" ]; then
-            NOTES="See CHANGELOG.md for details."
-          fi
-          # Write to file to preserve multiline
-          echo "$NOTES" > release_notes.txt
-          cat release_notes.txt
-
-      # ── 9. Create GitHub Release ───────────────────────────────────────────
-      - name: Create GitHub Release
+      - name: Upload release assets
         uses: softprops/action-gh-release@v2
         with:
-          name: "${{ steps.version.outputs.version }} — Zoos Global DNS Monitor for Datadog"
-          body_path: release_notes.txt
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
           files: |
-            release/${{ steps.version.outputs.asset_name }}.zip
-            release/${{ steps.version.outputs.asset_name }}.zip.sha256
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # ── 10. Print release summary ──────────────────────────────────────────
-      - name: Release summary
-        run: |
-          echo "================================================"
-          echo "  Release published successfully"
-          echo "================================================"
-          echo "  Tag     : ${{ steps.version.outputs.version }}"
-          echo "  Asset   : ${{ steps.version.outputs.asset_name }}.zip"
-          echo "  URL     : https://github.com/${{ github.repository }}/releases/tag/${{ steps.version.outputs.version }}"
-          echo "================================================"
+            dist/dns-monitor.exe
+            dist/dns-monitor-${{ env.VERSION }}-windows-amd64.zip

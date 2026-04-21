@@ -1,6 +1,4 @@
 # .github/workflows/ci.yaml
-# Zoos Global — Microsoft DNS Monitor for Datadog
-# https://www.zoosglobal.com
 
 name: CI
 
@@ -32,15 +30,15 @@ jobs:
       - name: Download dependencies
         run: go mod download
 
-      - name: Vet (windows/amd64 target)
+      - name: Vet (windows target)
         run: GOOS=windows GOARCH=amd64 go vet ./...
 
-      - name: Build dns-monitor.exe
+      - name: Build test binary
         env:
           GOOS: windows
           GOARCH: amd64
-          CGO_ENABLED: "0"
+          CGO_ENABLED: 0
         run: |
           mkdir -p dist
-          go build -ldflags "-s -w -X main.version=1.0.0" -o dist/dns-monitor.exe .
+          go build -o dist/dns-monitor.exe .
           ls -lh dist/dns-monitor.exe
