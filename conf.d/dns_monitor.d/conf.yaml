@@ -1,0 +1,25 @@
+## conf.d/dns_monitor.d/conf.yaml
+## Zoos Global — Microsoft DNS Monitor for Datadog
+## https://www.zoosglobal.com
+##
+## Copy to: C:\ProgramData\Datadog\conf.d\dns_monitor.d\conf.yaml
+## Restart the Datadog Agent after changes.
+
+init_config:
+
+instances:
+  - ## Path to dns-monitor.exe
+    ## Default: C:\ProgramData\Datadog\dns-monitor.exe
+    binary_path: 'C:\ProgramData\Datadog\dns-monitor.exe'
+
+    ## Path to the binary's own config file
+    ## Default: C:\ProgramData\Datadog\dns-monitor-config.yaml
+    config_path: 'C:\ProgramData\Datadog\dns-monitor-config.yaml'
+
+    ## Timeout in seconds — must be less than min_collection_interval
+    ## Default: 55
+    timeout: 55
+
+    ## How often the Agent calls this check (seconds)
+    ## Default: 60
+    min_collection_interval: 60
