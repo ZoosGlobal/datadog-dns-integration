@@ -8,6 +8,7 @@
 package collector
 
 import (
+	"context"
 	"net"
 	"os"
 	"time"
@@ -18,21 +19,25 @@ import (
 // resolveVia127 resolves a domain against 127.0.0.1 (the local DNS server)
 // and returns latency in milliseconds and whether it succeeded.
 func resolveVia127(domain string, timeoutSec int) (bool, float64) {
+	dialer := &net.Dialer{
+		Timeout: time.Duration(timeoutSec) * time.Second,
+	}
+
 	resolver := &net.Resolver{
 		PreferGo: true,
-		Dial: func(ctx interface{ Done() <-chan struct{} }, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: time.Duration(timeoutSec) * time.Second}
-			return d.DialContext(nil, "udp", "127.0.0.1:53")
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "udp", "127.0.0.1:53")
 		},
 	}
 
-	// Use standard resolver — simpler and sufficient for latency measurement
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
 	t0 := time.Now()
-	addrs, err := net.LookupHost(domain)
+	addrs, err := resolver.LookupHost(ctx, domain)
 	elapsed := time.Since(t0).Seconds() * 1000
 
 	_ = addrs
-	_ = resolver
 	return err == nil, elapsed
 }
 
