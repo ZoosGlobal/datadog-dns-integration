@@ -17,14 +17,11 @@ import (
 	"github.com/ZoosGlobal/datadog-dns-integration/statsd"
 )
 
-// Run executes one full collection cycle:
-//  1. Builds global tags (env, host, role:dns, dns_server)
-//  2. Runs all collectors in sequence
-//  3. Flushes all metric lines to DogStatsD in batched UDP packets
-//  4. Returns the number of metrics emitted
+// Run executes one full collection cycle and flushes all metrics to DogStatsD.
 func Run(cfg *config.Config) (int, error) {
-	// Build global tags
 	hostname, _ := os.Hostname()
+
+	// Build global tags
 	globalTags := []string{
 		fmt.Sprintf("env:%s", cfg.Env),
 		fmt.Sprintf("host:%s", hostname),
@@ -40,45 +37,60 @@ func Run(cfg *config.Config) (int, error) {
 	}
 	defer client.Close()
 
+	// Auto-detect forwarders if none configured
+	forwarderIPs := cfg.ForwarderIPs
+	if len(forwarderIPs) == 0 {
+		forwarderIPs = DetectForwarders()
+	}
+
 	t0 := time.Now()
 	var allLines []string
 
 	// ── 1. Service health ────────────────────────────────────────────────────
-	allLines = append(allLines, CollectService(client, nil)...)
+	svcLines := CollectService(client, nil)
+	allLines = append(allLines, svcLines...)
+	log.Printf("[dns-monitor] service metrics: %d", len(svcLines))
+	for _, l := range svcLines { log.Println(l) }
 
-	// ── 2. Perfmon counters ──────────────────────────────────────────────────
-	allLines = append(allLines, CollectPerfmon(client, nil)...)
+	// ── 2. Perfmon counters via PDH ──────────────────────────────────────────
+	perfLines := CollectPerfmon(client, nil)
+	allLines = append(allLines, perfLines...)
+	log.Printf("[dns-monitor] perfmon metrics: %d", len(perfLines))
 
 	// ── 3. Forwarder availability ────────────────────────────────────────────
-	allLines = append(allLines, CollectForwarders(
-		client, nil,
-		cfg.ForwarderIPs,
-		cfg.ForwarderProbeDomain,
-		cfg.ForwarderTimeoutSec,
-	)...)
+	fwdLines := CollectForwarders(client, nil, forwarderIPs, cfg.ForwarderProbeDomain, cfg.ForwarderTimeoutSec)
+	allLines = append(allLines, fwdLines...)
+	log.Printf("[dns-monitor] forwarders metrics: %d", len(fwdLines))
+	for _, l := range fwdLines { log.Println(l) }
 
 	// ── 4. Resolution latency ────────────────────────────────────────────────
-	allLines = append(allLines, CollectResolution(
-		client, nil,
-		cfg.ResolutionProbeDomain,
-		cfg.ResolutionProbeWarnMs,
-		cfg.ResolutionProbeCritMs,
-	)...)
+	resLines := CollectResolution(client, nil, cfg.ResolutionProbeDomain, cfg.ResolutionProbeWarnMs, cfg.ResolutionProbeCritMs)
+	allLines = append(allLines, resLines...)
+	log.Printf("[dns-monitor] resolution metrics: %d", len(resLines))
+	for _, l := range resLines { log.Println(l) }
 
 	// ── 5. Zone health ───────────────────────────────────────────────────────
-	allLines = append(allLines, CollectZones(client, nil)...)
+	zoneLines := CollectZones(client, nil)
+	allLines = append(allLines, zoneLines...)
+	log.Printf("[dns-monitor] zones metrics: %d", len(zoneLines))
+	for _, l := range zoneLines { log.Println(l) }
 
 	// ── 6. Process metrics ───────────────────────────────────────────────────
-	allLines = append(allLines, CollectProcess(client, nil)...)
+	procLines := CollectProcess(client, nil)
+	allLines = append(allLines, procLines...)
+	log.Printf("[dns-monitor] process metrics: %d", len(procLines))
+	for _, l := range procLines { log.Println(l) }
 
-	// ── Self-monitoring: collection duration ─────────────────────────────────
+	// ── Self-monitoring ───────────────────────────────────────────────────────
 	collectMs := time.Since(t0).Seconds() * 1000
-	allLines = append(allLines, client.Line("dns.monitor.collection_duration_ms", collectMs, "g",
-		[]string{"category:monitor"}))
-	allLines = append(allLines, client.Line("dns.monitor.metrics_emitted", float64(len(allLines)+1), "g",
-		[]string{"category:monitor"}))
+	monLines := []string{
+		client.Line("dns.monitor.collection_duration_ms", collectMs, "g", []string{"category:monitor"}),
+		client.Line("dns.monitor.metrics_emitted", float64(len(allLines)+2), "g", []string{"category:monitor"}),
+	}
+	allLines = append(allLines, monLines...)
+	for _, l := range monLines { log.Println(l) }
 
-	// ── Flush all metrics in batched UDP packets ──────────────────────────────
+	// ── Flush all to DogStatsD ────────────────────────────────────────────────
 	client.Flush(allLines)
 
 	log.Printf("[dns-monitor] cycle complete | metrics:%d | duration:%.0fms | statsd:%s:%d",

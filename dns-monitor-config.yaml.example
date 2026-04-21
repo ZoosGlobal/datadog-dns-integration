@@ -1,0 +1,44 @@
+## dns-monitor-config.yaml
+## Zoos Global — Microsoft DNS Monitor for Datadog
+## https://www.zoosglobal.com
+##
+## Copy to: C:\ProgramData\Datadog\dns-monitor-config.yaml
+## and edit for your environment.
+
+# ── DogStatsD transport ────────────────────────────────────────────────────
+statsd_host: "127.0.0.1"
+statsd_port: 8125
+
+# ── Datadog tagging ────────────────────────────────────────────────────────
+env: "production"
+
+# Additional tags applied to every metric
+global_tags:
+  - "service:dns"
+  - "team:infrastructure"
+  # - "datacenter:dc1"
+  # - "region:ap-south-1"
+
+# ── DNS Resolution probe ───────────────────────────────────────────────────
+# Domain to resolve against 127.0.0.1 to measure resolution latency.
+# The server's own hostname is always probed as a baseline.
+resolution_probe_domain: "www.google.com"
+
+# Alert thresholds (milliseconds)
+resolution_warn_ms: 100
+resolution_crit_ms: 500
+
+# ── Forwarder availability ─────────────────────────────────────────────────
+# List every forwarder IP configured on this DNS server.
+# The binary probes each one directly on UDP/53.
+forwarder_ips:
+  - "8.8.8.8"
+  - "8.8.4.4"
+  # - "1.1.1.1"
+  # - "168.63.129.16"   # Azure DNS
+
+# Domain used for forwarder probe (a random subdomain is prefixed to bust cache)
+forwarder_probe_domain: "example.com"
+
+# Seconds to wait for a forwarder response before marking as down
+forwarder_timeout_sec: 5

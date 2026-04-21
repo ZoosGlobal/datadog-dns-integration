@@ -7,15 +7,14 @@ VERSION  = 1.0.0
 MODULE   = github.com/ZoosGlobal/datadog-dns-integration
 LDFLAGS  = -s -w -X main.version=$(VERSION)
 
-.PHONY: build clean deps lint release
+.PHONY: build clean deps lint
 
 ## build: cross-compile for Windows amd64 (runs on any OS)
 build:
-	@mkdir -p dist
 	GOOS=windows GOARCH=amd64 go build \
 		-ldflags "$(LDFLAGS)" \
 		-o dist/$(BINARY) \
-		.
+		./...
 	@echo "Built: dist/$(BINARY)"
 
 ## deps: download and tidy Go modules
