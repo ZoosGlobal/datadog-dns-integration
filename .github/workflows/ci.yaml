@@ -1,0 +1,48 @@
+# .github/workflows/ci.yaml
+# Zoos Global — Microsoft DNS Monitor for Datadog
+# https://www.zoosglobal.com
+#
+# Runs on every push to main and every pull request.
+# Catches build errors and vet issues before they reach a release tag.
+
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'CHANGELOG.md'
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    name: Build and vet
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Vet (windows/amd64 target)
+        run: GOOS=windows GOARCH=amd64 go vet ./...
+
+      - name: Build dns-monitor.exe
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          go build -o dist/dns-monitor.exe ./...
+          echo "Build OK: $(ls -lh dist/dns-monitor.exe)"

@@ -15,7 +15,6 @@ import (
 	"log"
 	"os/exec"
 	"strings"
-	"time"
 
 	"github.com/ZoosGlobal/datadog-dns-integration/statsd"
 )
@@ -39,10 +38,6 @@ Get-DnsServerZone -ErrorAction SilentlyContinue |
   Select-Object ZoneName,ZoneType,IsReverseLookupZone,IsPaused,IsAutoCreated,IsDsIntegrated,IsSigned |
   ConvertTo-Json -Compress
 `
-	ctx, cancel := time.AfterFunc(10*time.Second, func() {})
-	defer cancel()
-	_ = ctx
-
 	cmd := exec.Command("powershell.exe",
 		"-NonInteractive", "-NoProfile", "-ExecutionPolicy", "Bypass",
 		"-Command", strings.TrimSpace(script))
