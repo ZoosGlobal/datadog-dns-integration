@@ -1,0 +1,42 @@
+## conf.d/dns_monitor.d/conf.yaml
+## Zoos Global — Microsoft DNS Monitor for Datadog
+## https://www.zoosglobal.com
+##
+## Copy to: C:\ProgramData\Datadog\conf.d\dns_monitor.d\conf.yaml
+## Restart the Datadog Agent after any changes.
+
+init_config:
+
+instances:
+  - ## Datadog environment tag
+    env: "production"
+
+    ## Extra tags applied to every metric
+    tags:
+      - "service:dns"
+      - "team:infrastructure"
+
+    ## DNS Resolution probe thresholds (milliseconds)
+    ## dns.resolution.service_check: 0=OK  1=WARN  2=CRIT
+    resolution_warn_ms: 100
+    resolution_crit_ms: 500
+
+    ## External resolution probe domain
+    resolution_probe_domain: "www.google.com"
+
+    ## Forwarder IPs to probe — leave empty for auto-detection
+    ## Auto-detection runs Get-DnsServerForwarder at each cycle
+    forwarder_ips: []
+    # forwarder_ips:
+    #   - "8.8.8.8"
+    #   - "1.1.1.1"
+
+    ## Forwarder probe settings
+    forwarder_probe_domain: "example.com"
+    forwarder_timeout_sec: 5
+
+    ## Event log lookback window (minutes)
+    event_lookback_minutes: 5
+
+    ## How often the Agent runs this check (seconds)
+    min_collection_interval: 60
