@@ -4,6 +4,14 @@
 ##
 ## Copy to: C:\ProgramData\Datadog\conf.d\dns_monitor.d\conf.yaml
 ## Restart the Datadog Agent after any changes.
+##
+## CHANGE LOG:
+##   2026-05-08  Added resolution_probe_domains (list) to support monitoring
+##               nslookup latency for multiple domains simultaneously.
+##               Each domain is probed independently every collection cycle and
+##               emits dns.resolution.latency_ms tagged with zone:<domain>.
+##               Backward-compatible: resolution_probe_domain (single string)
+##               still works if resolution_probe_domains is not set.
 
 init_config:
 
@@ -16,27 +24,53 @@ instances:
       - "service:dns"
       - "team:infrastructure"
 
-    ## DNS Resolution probe thresholds (milliseconds)
+    ## ── Resolution probe thresholds (milliseconds) ───────────────────────────
     ## dns.resolution.service_check: 0=OK  1=WARN  2=CRIT
-    resolution_warn_ms: 100
-    resolution_crit_ms: 500
+    ## Applied to every domain listed in resolution_probe_domains.
+    resolution_warn_ms: 20      # tightened — internal DNS should respond < 20ms
+    resolution_crit_ms: 100     # anything over 100ms is a real problem
 
-    ## External resolution probe domain
-    resolution_probe_domain: "www.google.com"
+    ## ── Multi-domain resolution probes ──────────────────────────────────────
+    ## List every domain whose nslookup latency you want to track.
+    ## Each domain is probed via:
+    ##   • Baseline  : raw UDP query to 127.0.0.1:53  (probe_scope:baseline)
+    ##   • External  : socket.getaddrinfo() via OS resolver (probe_scope:external)
+    ##
+    ## Metrics emitted per domain:
+    ##   dns.resolution.latency_ms{zone:<domain>, probe_scope:baseline}
+    ##   dns.resolution.latency_ms{zone:<domain>, probe_scope:external}
+    ##   dns.resolution.status{zone:<domain>, ...}
+    ##   dns.resolution.service_check{zone:<domain>, ...}
+    ##
+    ## Suggested Datadog monitor query:
+    ##   avg:dns.resolution.latency_ms{zone:corp.zoosglobal.com,probe_scope:baseline} > 100
+    resolution_probe_domains:
+      - "corp.exlservice.com"       # primary internal corporate domain
+      - "www.shivamsancc.com"       # mail services
+      - "www.google.com"            # external internet reachability baseline
 
-    ## Forwarder IPs to probe — leave empty for auto-detection
-    ## Auto-detection runs Get-DnsServerForwarder at each cycle
+    ## ── Legacy single-domain key (kept for backward compatibility) ───────────
+    ## Ignored when resolution_probe_domains is set above.
+    ## Uncomment and remove resolution_probe_domains to revert to single-domain mode.
+    # resolution_probe_domain: "www.google.com"
+
+    ## ── Forwarder probing ────────────────────────────────────────────────────
+    ## Leave empty for auto-detection via Get-DnsServerForwarder each cycle.
+    ## Pin IPs here to avoid the extra PowerShell call every 60s.
     forwarder_ips: []
     # forwarder_ips:
     #   - "8.8.8.8"
     #   - "1.1.1.1"
 
-    ## Forwarder probe settings
+    ## Domain used for cache-busting UDP probes sent to each forwarder IP.
+    ## Should be a domain the forwarder can resolve (NXDOMAIN is fine — it
+    ## only indicates server UP, not correctness).
     forwarder_probe_domain: "example.com"
     forwarder_timeout_sec: 5
 
-    ## Event log lookback window (minutes)
+    ## ── Event log lookback window (minutes) ──────────────────────────────────
     event_lookback_minutes: 5
 
-    ## How often the Agent runs this check (seconds)
+    ## ── Collection interval ──────────────────────────────────────────────────
+    ## How often the Agent runs this check (seconds).
     min_collection_interval: 60

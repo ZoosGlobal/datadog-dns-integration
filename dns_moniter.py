@@ -6,34 +6,52 @@
 # Datadog Agent custom check — runs every 60s via checks.d
 # No binary, no Go, no Task Scheduler, no Defender issues.
 #
+# Integration namespace : zg
+# All metrics are prefixed zg.dns.* to avoid conflicts with
+# Datadog's built-in dns.* namespace and to follow the same
+# convention used by commercial integrations (rapdev.*, etc.)
+#
 # Collection strategy:
 #   Primary  : pywin32 (WMI + win32pdh + win32service)
 #   Fallback : subprocess PowerShell / sc.exe / raw socket
 #   Always   : Python stdlib socket (forwarder + resolution probes)
 #
 # Metric categories:
-#   dns.service.*       — service health
-#   dns.performance.*   — PDH perfmon counters
-#   dns.queries.*       — query type breakdown (Get-DnsServerStatistics)
-#   dns.errors.*        — NXDOMAIN, SERVFAIL, refused, etc.
-#   dns.recursion.*     — recursive resolution stats
-#   dns.cache.*         — cache hit ratio, size, memory
-#   dns.updates.*       — dynamic update stats
-#   dns.security.*      — TSIG, TKEY, context queue
-#   dns.dnssec.*        — DNSSEC validation stats
-#   dns.forwarders.*    — forwarder availability + latency
-#   dns.resolution.*    — resolution response time
-#   dns.zones.*         — zone health
-#   dns.process.*       — dns.exe process metrics
-#   dns.events.*        — Windows Event Log signals
-#   dns.scavenging.*    — scavenging health
-#   dns.monitor.*       — self-monitoring
+#   zg.dns.service.*       — service health
+#   zg.dns.performance.*   — PDH perfmon counters
+#   zg.dns.queries.*       — query type breakdown (Get-DnsServerStatistics)
+#   zg.dns.errors.*        — NXDOMAIN, SERVFAIL, refused, etc.
+#   zg.dns.recursion.*     — recursive resolution stats
+#   zg.dns.cache.*         — cache hit ratio, size, memory
+#   zg.dns.updates.*       — dynamic update stats
+#   zg.dns.security.*      — TSIG, TKEY, context queue
+#   zg.dns.dnssec.*        — DNSSEC validation stats
+#   zg.dns.forwarders.*    — forwarder availability + latency
+#   zg.dns.resolution.*    — resolution response time (per-domain)
+#   zg.dns.zones.*         — zone health
+#   zg.dns.process.*       — dns.exe process metrics
+#   zg.dns.events.*        — Windows Event Log signals
+#   zg.dns.scavenging.*    — scavenging health
+#   zg.dns.monitor.*       — self-monitoring
+#
+# Service checks:
+#   zg.dns.service.status         — DNS Windows service state
+#   zg.dns.resolution.latency     — per-domain resolution latency
+#
+# CHANGE LOG:
+#   2026-05-08  v1.0.0  Initial release
+#   2026-05-08  v1.1.0  Multi-domain resolution probes:
+#                       resolution_probe_domains (list) replaces
+#                       resolution_probe_domain (str). Backward-compatible.
+#                       Each domain emits metrics tagged zone:<domain>.
+#   2026-05-08  v1.2.0  Renamed all metrics to zg.dns.* namespace to avoid
+#                       conflicts with Datadog built-in dns.* metrics and to
+#                       follow commercial integration naming conventions.
 # ============================================================
 
 from __future__ import annotations
 
 import json
-import os
 import random
 import socket
 import string
@@ -44,13 +62,18 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from datadog_checks.base import AgentCheck
 
+# ── Integration metadata (mirrors commercial integrations) ────────────────────
+__version__   = '1.2.0'
+__author__    = 'Zoos Global'
+__url__       = 'https://www.zoosglobal.com'
+INTEGRATION   = 'zg_dns_monitor'
+METRIC_PREFIX = 'zg.dns'
+
 # ── pywin32 availability flag ─────────────────────────────────────────────────
 try:
     import win32service
-    import win32serviceutil
     import win32con
     import win32pdh
-    import win32pdhutil
     import wmi as _wmi
     _WMI_CLIENT = None
     PYWIN32_OK = True
@@ -116,7 +139,7 @@ def _probe_dns(server: str, base_domain: str, timeout: float = 5.0) -> Tuple[boo
     tx_id  = random.randint(1, 0xFFFE)
     target = f'{_random_label()}.{base_domain}'
     query  = _build_dns_query(target, tx_id)
-
+    sock   = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(timeout)
@@ -124,35 +147,35 @@ def _probe_dns(server: str, base_domain: str, timeout: float = 5.0) -> Tuple[boo
         sock.sendto(query, (server, 53))
         data, _ = sock.recvfrom(512)
         elapsed = (time.monotonic() - t0) * 1000
-        sock.close()
         return _is_valid_dns_response(data, tx_id), round(elapsed, 2)
     except Exception:
         return False, 0.0
     finally:
-        try:
-            sock.close()
-        except Exception:
-            pass
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 # ── PDH counter reader ────────────────────────────────────────────────────────
 # Maps metric name → PDH English counter path
 _PDH_COUNTERS = {
-    'dns.performance.queries_received_total':          r'\DNS\Total Query Received',
-    'dns.performance.responses_sent_total':            r'\DNS\Total Response Sent',
-    'dns.performance.udp_queries_total':               r'\DNS\UDP Query Received',
-    'dns.performance.tcp_queries_total':               r'\DNS\TCP Query Received',
-    'dns.performance.recursive_queries_total':         r'\DNS\Recursive Queries',
-    'dns.performance.recursive_query_failures_total':  r'\DNS\Recursive Query Failure',
-    'dns.performance.recursive_query_timeouts_total':  r'\DNS\Recursive TimeOut',
-    'dns.performance.dynamic_updates_total':           r'\DNS\Dynamic Update Received',
-    'dns.performance.secure_updates_total':            r'\DNS\Secure Update Received',
-    'dns.performance.zone_transfer_requests_total':    r'\DNS\Zone Transfer Request Received',
-    'dns.performance.zone_transfer_success_total':     r'\DNS\Zone Transfer Success',
-    'dns.performance.zone_transfer_failures_total':    r'\DNS\Zone Transfer Failure',
-    'dns.performance.notify_sent_total':               r'\DNS\Notify Sent',
-    'dns.performance.notify_received_total':           r'\DNS\Notify Received',
-    'dns.performance.unmatched_responses_total':       r'\DNS\Unmatched Responses Received',
+    f'{METRIC_PREFIX}.performance.queries_received_total':          r'\DNS\Total Query Received',
+    f'{METRIC_PREFIX}.performance.responses_sent_total':            r'\DNS\Total Response Sent',
+    f'{METRIC_PREFIX}.performance.udp_queries_total':               r'\DNS\UDP Query Received',
+    f'{METRIC_PREFIX}.performance.tcp_queries_total':               r'\DNS\TCP Query Received',
+    f'{METRIC_PREFIX}.performance.recursive_queries_total':         r'\DNS\Recursive Queries',
+    f'{METRIC_PREFIX}.performance.recursive_query_failures_total':  r'\DNS\Recursive Query Failure',
+    f'{METRIC_PREFIX}.performance.recursive_query_timeouts_total':  r'\DNS\Recursive TimeOut',
+    f'{METRIC_PREFIX}.performance.dynamic_updates_total':           r'\DNS\Dynamic Update Received',
+    f'{METRIC_PREFIX}.performance.secure_updates_total':            r'\DNS\Secure Update Received',
+    f'{METRIC_PREFIX}.performance.zone_transfer_requests_total':    r'\DNS\Zone Transfer Request Received',
+    f'{METRIC_PREFIX}.performance.zone_transfer_success_total':     r'\DNS\Zone Transfer Success',
+    f'{METRIC_PREFIX}.performance.zone_transfer_failures_total':    r'\DNS\Zone Transfer Failure',
+    f'{METRIC_PREFIX}.performance.notify_sent_total':               r'\DNS\Notify Sent',
+    f'{METRIC_PREFIX}.performance.notify_received_total':           r'\DNS\Notify Received',
+    f'{METRIC_PREFIX}.performance.unmatched_responses_total':       r'\DNS\Unmatched Responses Received',
 }
 
 
@@ -169,13 +192,10 @@ def _read_pdh_counters(log) -> Dict[str, float]:
         cmd = ['typeperf.exe'] + paths + ['-sc', '1']
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=20,
-            creationflags=0x08000000  # CREATE_NO_WINDOW — suppress console
+            creationflags=0x08000000  # CREATE_NO_WINDOW
         )
         out = proc.stdout
 
-        # typeperf output format:
-        #   "Timestamp","\DNS\Total Query Received",...
-        #   "04/22/2026 15:00:00.000","12345",...
         data_lines = [
             l for l in out.splitlines()
             if l.strip().startswith('"') and ',' in l
@@ -183,7 +203,7 @@ def _read_pdh_counters(log) -> Dict[str, float]:
         ]
 
         if not data_lines:
-            log.warning('[dns_monitor] typeperf: no data lines in output')
+            log.warning('[zg_dns_monitor] typeperf: no data lines in output')
             return results
 
         vals  = [v.strip().strip('"') for v in data_lines[-1].split(',')[1:]]
@@ -193,26 +213,26 @@ def _read_pdh_counters(log) -> Dict[str, float]:
             if i < len(vals) and vals[i]:
                 try:
                     v = float(vals[i])
-                    if v >= 0:  # typeperf returns -1 for unavailable counters
+                    if v >= 0:
                         results[name] = v
                 except ValueError:
                     pass
 
-        log.debug(f'[dns_monitor] typeperf: {len(results)}/{len(names)} counters collected')
+        log.debug(f'[zg_dns_monitor] typeperf: {len(results)}/{len(names)} counters collected')
 
     except subprocess.TimeoutExpired:
-        log.warning('[dns_monitor] typeperf timed out')
+        log.warning('[zg_dns_monitor] typeperf timed out')
     except Exception as e:
-        log.warning(f'[dns_monitor] typeperf failed: {e}')
+        log.warning(f'[zg_dns_monitor] typeperf failed: {e}')
 
     return results
+
 
 # ── DNS Server Statistics (Get-DnsServerStatistics) ──────────────────────────
 def _read_dns_statistics(log) -> Dict[str, Any]:
     """
     Read all DNS server statistics via PowerShell Get-DnsServerStatistics.
     Returns a flat dict of property_name → value.
-    Uses ConvertTo-Json for reliable parsing.
     """
     script = r"""
 $s = Get-DnsServerStatistics -ErrorAction SilentlyContinue
@@ -272,15 +292,15 @@ if ($c) {
 # UpdateStatistics
 $u = $s.UpdateStatistics
 if ($u) {
-    $out['u_Received']      = try { [int64]$u.Received }      catch { 0 }
-    $out['u_Completed']     = try { [int64]$u.Completed }     catch { 0 }
-    $out['u_Rejected']      = try { [int64]$u.Rejected }      catch { 0 }
-    $out['u_Refused']       = try { [int64]$u.Refused }       catch { 0 }
-    $out['u_Timeout']       = try { [int64]$u.Timeout }       catch { 0 }
-    $out['u_DsWriteFailure']= try { [int64]$u.DsWriteFailure } catch { 0 }
-    $out['u_SecureSuccess'] = try { [int64]$u.SecureSuccess } catch { 0 }
-    $out['u_SecureFailure'] = try { [int64]$u.SecureFailure } catch { 0 }
-    $out['u_Queued']        = try { [int64]$u.Queued }        catch { 0 }
+    $out['u_Received']       = try { [int64]$u.Received }       catch { 0 }
+    $out['u_Completed']      = try { [int64]$u.Completed }      catch { 0 }
+    $out['u_Rejected']       = try { [int64]$u.Rejected }       catch { 0 }
+    $out['u_Refused']        = try { [int64]$u.Refused }        catch { 0 }
+    $out['u_Timeout']        = try { [int64]$u.Timeout }        catch { 0 }
+    $out['u_DsWriteFailure'] = try { [int64]$u.DsWriteFailure } catch { 0 }
+    $out['u_SecureSuccess']  = try { [int64]$u.SecureSuccess }  catch { 0 }
+    $out['u_SecureFailure']  = try { [int64]$u.SecureFailure }  catch { 0 }
+    $out['u_Queued']         = try { [int64]$u.Queued }         catch { 0 }
 }
 
 # SecurityStatistics
@@ -296,13 +316,13 @@ if ($sec) {
 # DnssecStatistics
 $d = $s.DnssecStatistics
 if ($d) {
-    $out['d_ValidationSuccess']      = try { [int64]$d.DnssecValidationSuccess }      catch { 0 }
-    $out['d_ValidationFailure']      = try { [int64]$d.DnssecValidationFailure }      catch { 0 }
-    $out['d_BadSignature']           = try { [int64]$d.DnssecBadSignature }           catch { 0 }
-    $out['d_NoSignature']            = try { [int64]$d.DnssecNoSignature }            catch { 0 }
-    $out['d_BogusTotal']             = try { [int64]$d.DnssecBogusTotal }             catch { 0 }
-    $out['d_TimestampOutOfRange']    = try { [int64]$d.DnssecTimestampOutOfRange }    catch { 0 }
-    $out['d_AlgorithmUnsupported']   = try { [int64]$d.DnssecAlgorithmUnsupported }   catch { 0 }
+    $out['d_ValidationSuccess']    = try { [int64]$d.DnssecValidationSuccess }    catch { 0 }
+    $out['d_ValidationFailure']    = try { [int64]$d.DnssecValidationFailure }    catch { 0 }
+    $out['d_BadSignature']         = try { [int64]$d.DnssecBadSignature }         catch { 0 }
+    $out['d_NoSignature']          = try { [int64]$d.DnssecNoSignature }          catch { 0 }
+    $out['d_BogusTotal']           = try { [int64]$d.DnssecBogusTotal }           catch { 0 }
+    $out['d_TimestampOutOfRange']  = try { [int64]$d.DnssecTimestampOutOfRange }  catch { 0 }
+    $out['d_AlgorithmUnsupported'] = try { [int64]$d.DnssecAlgorithmUnsupported } catch { 0 }
 }
 
 # MemoryStatistics
@@ -317,45 +337,59 @@ $out | ConvertTo-Json -Compress
     try:
         return json.loads(raw)
     except Exception as e:
-        log.warning(f'[dns_monitor] statistics JSON parse failed: {e}')
+        log.warning(f'[zg_dns_monitor] statistics JSON parse failed: {e}')
         return {}
 
 
 # ── Main check class ──────────────────────────────────────────────────────────
 class DnsMonitorCheck(AgentCheck):
 
+    # ── Integration identity ──────────────────────────────────────────────────
+    #__NAMESPACE__ = METRIC_PREFIX   # zg.dns — all self.gauge/count calls are
+                                    # automatically prefixed when using this attr
+                                    # (AgentCheck respects __NAMESPACE__ in v7+)
+
     def check(self, instance: Dict[str, Any]) -> None:
         t0 = time.monotonic()
 
-        # Config
+        # ── Config ────────────────────────────────────────────────────────────
         env          = instance.get('env', 'production')
         forwarders   = instance.get('forwarder_ips', [])
         probe_domain = instance.get('forwarder_probe_domain', 'example.com')
-        res_domain   = instance.get('resolution_probe_domain', 'www.google.com')
         warn_ms      = float(instance.get('resolution_warn_ms', 100))
         crit_ms      = float(instance.get('resolution_crit_ms', 500))
         fwd_timeout  = float(instance.get('forwarder_timeout_sec', 5))
+
+        # Multi-domain resolution probe support
+        res_domains: List[str] = instance.get('resolution_probe_domains', [])
+        if not res_domains:
+            legacy = instance.get('resolution_probe_domain', 'www.google.com')
+            res_domains = [legacy] if legacy else ['www.google.com']
 
         base_tags = [
             f'env:{env}',
             f'host:{socket.gethostname()}',
             'role:dns',
             f'dns_server:{socket.gethostname()}',
+            f'integration:{INTEGRATION}',
+            f'integration_version:{__version__}',
         ]
         base_tags += instance.get('tags', [])
 
-        # Auto-detect forwarders if none configured
         if not forwarders:
             forwarders = self._detect_forwarders()
 
         metric_count = 0
 
-        # Run all collectors
+        # ── Run all collectors ────────────────────────────────────────────────
         metric_count += self._collect_service(base_tags)
         metric_count += self._collect_perfmon(base_tags)
         metric_count += self._collect_statistics(base_tags)
         metric_count += self._collect_forwarders(base_tags, forwarders, probe_domain, fwd_timeout)
-        metric_count += self._collect_resolution(base_tags, res_domain, warn_ms, crit_ms)
+
+        for domain in res_domains:
+            metric_count += self._collect_resolution(base_tags, domain, warn_ms, crit_ms)
+
         metric_count += self._collect_zones(base_tags)
         metric_count += self._collect_process(base_tags)
         metric_count += self._collect_events(base_tags, instance.get('event_lookback_minutes', 5))
@@ -363,29 +397,29 @@ class DnsMonitorCheck(AgentCheck):
 
         # Self-monitoring
         duration_ms = (time.monotonic() - t0) * 1000
-        self.gauge('dns.monitor.collection_duration_ms', duration_ms, tags=base_tags + ['category:monitor'])
-        self.gauge('dns.monitor.metrics_emitted', metric_count + 2,   tags=base_tags + ['category:monitor'])
+        self.gauge(f'{METRIC_PREFIX}.monitor.collection_duration_ms', duration_ms, tags=base_tags + ['category:monitor'])
+        self.gauge(f'{METRIC_PREFIX}.monitor.metrics_emitted',        metric_count + 2, tags=base_tags + ['category:monitor'])
+        self.gauge(f'{METRIC_PREFIX}.monitor.integration_version',    1, tags=base_tags + [f'version:{__version__}', 'category:monitor'])
 
-        self.log.info(f'[dns_monitor] cycle complete | metrics:{metric_count} | duration:{duration_ms:.0f}ms')
+        self.log.info(f'[zg_dns_monitor] v{__version__} cycle complete | metrics:{metric_count} | duration:{duration_ms:.0f}ms')
 
     # ── 1. Service health ─────────────────────────────────────────────────────
     def _collect_service(self, tags: List[str]) -> int:
         stags = tags + ['category:service']
         n = 0
 
-        is_up    = 0
-        is_auto  = 0
+        is_up     = 0
+        is_auto   = 0
         sc_status = AgentCheck.CRITICAL
 
-        # Primary: pywin32
         if PYWIN32_OK:
             try:
                 scm = win32service.OpenSCManager(None, None, win32con.GENERIC_READ)
                 try:
-                    svc = win32service.OpenService(scm, 'DNS', win32service.SERVICE_QUERY_STATUS | win32service.SERVICE_QUERY_CONFIG)
-                    status  = win32service.QueryServiceStatus(svc)
-                    config  = win32service.QueryServiceConfig(svc)
-                    state   = status[1]
+                    svc    = win32service.OpenService(scm, 'DNS', win32service.SERVICE_QUERY_STATUS | win32service.SERVICE_QUERY_CONFIG)
+                    status = win32service.QueryServiceStatus(svc)
+                    config = win32service.QueryServiceConfig(svc)
+                    state  = status[1]
                     is_up   = 1 if state == win32service.SERVICE_RUNNING else 0
                     is_auto = 1 if config[1] == win32service.SERVICE_AUTO_START else 0
                     sc_status = AgentCheck.OK if is_up else AgentCheck.CRITICAL
@@ -393,47 +427,42 @@ class DnsMonitorCheck(AgentCheck):
                 finally:
                     win32service.CloseServiceHandle(scm)
             except Exception as e:
-                self.log.warning(f'[dns_monitor] service pywin32 failed: {e}')
+                self.log.warning(f'[zg_dns_monitor] service pywin32 failed: {e}')
                 is_up, is_auto, sc_status = self._service_via_sc()
         else:
             is_up, is_auto, sc_status = self._service_via_sc()
 
-        self.gauge('dns.service.up',         is_up,   tags=stags)
-        self.gauge('dns.service.status',     sc_status, tags=stags)
-        self.gauge('dns.service.start_auto', is_auto, tags=stags)
+        self.gauge(f'{METRIC_PREFIX}.service.up',         is_up,     tags=stags)
+        self.gauge(f'{METRIC_PREFIX}.service.status',     sc_status, tags=stags)
+        self.gauge(f'{METRIC_PREFIX}.service.start_auto', is_auto,   tags=stags)
         n += 3
 
-        # WID (Windows Internal Database)
         wid = self._check_wid()
-        self.gauge('dns.service.wid_running', wid, tags=stags)
+        self.gauge(f'{METRIC_PREFIX}.service.wid_running', wid, tags=stags)
         n += 1
 
-        self.service_check('dns.service.status',
-                           AgentCheck.OK if is_up else AgentCheck.CRITICAL,
-                           tags=stags,
-                           message='DNS service running' if is_up else 'DNS service stopped')
+        self.service_check(
+            f'{METRIC_PREFIX}.service.status',
+            AgentCheck.OK if is_up else AgentCheck.CRITICAL,
+            tags=stags,
+            message='DNS service running' if is_up else 'DNS service stopped',
+        )
         return n
 
     def _service_via_sc(self) -> Tuple[int, int, int]:
-        """Fallback: parse sc.exe output."""
-        out = subprocess.run(['sc', 'query', 'DNS'], capture_output=True, text=True, timeout=10).stdout.upper()
+        out     = subprocess.run(['sc', 'query', 'DNS'], capture_output=True, text=True, timeout=10).stdout.upper()
         is_up   = 1 if 'RUNNING' in out else 0
         is_auto = 0
         try:
-            cfg = subprocess.run(['sc', 'qc', 'DNS'], capture_output=True, text=True, timeout=10).stdout.upper()
+            cfg     = subprocess.run(['sc', 'qc', 'DNS'], capture_output=True, text=True, timeout=10).stdout.upper()
             is_auto = 1 if 'AUTO_START' in cfg else 0
         except Exception:
             pass
-        sc_status = AgentCheck.OK if is_up else AgentCheck.CRITICAL
-        return is_up, is_auto, sc_status
+        return is_up, is_auto, AgentCheck.OK if is_up else AgentCheck.CRITICAL
 
     def _check_wid(self) -> int:
-        """Check Windows Internal Database service."""
         try:
-            out = subprocess.run(
-                ['sc', 'query', 'MSSQL$MICROSOFT##WID'],
-                capture_output=True, text=True, timeout=10
-            ).stdout.upper()
+            out = subprocess.run(['sc', 'query', 'MSSQL$MICROSOFT##WID'], capture_output=True, text=True, timeout=10).stdout.upper()
             if 'RUNNING' in out:
                 return 1
             elif 'DOES NOT EXIST' in out or 'FAILED' in out:
@@ -444,19 +473,15 @@ class DnsMonitorCheck(AgentCheck):
 
     # ── 2. PDH Perfmon counters ────────────────────────────────────────────────
     def _collect_perfmon(self, tags: List[str]) -> int:
-        ptags = tags + ['category:performance']
+        ptags   = tags + ['category:performance']
         results = _read_pdh_counters(self.log)
         n = 0
         for name, val in results.items():
             self.count(name, val, tags=ptags)
             n += 1
-        if n == 0:
-            self.gauge('dns.performance.available', 0, tags=ptags)
-            n = 1
-        else:
-            self.gauge('dns.performance.available', 1, tags=ptags)
-            n += 1
-        return n
+        avail = 1 if n > 0 else 0
+        self.gauge(f'{METRIC_PREFIX}.performance.available', avail, tags=ptags)
+        return n + 1
 
     # ── 3. DNS Server Statistics ───────────────────────────────────────────────
     def _collect_statistics(self, tags: List[str]) -> int:
@@ -469,68 +494,67 @@ class DnsMonitorCheck(AgentCheck):
 
         # Query breakdown
         qtag = tags + ['category:queries']
-        self.count('dns.queries.total',      total_queries,                tags=qtag + ['query_type:ALL'])
-        self.count('dns.queries.type_a',     stats.get('q_TypeA', 0),      tags=qtag + ['query_type:A'])
-        self.count('dns.queries.type_aaaa',  stats.get('q_TypeAaaa', 0),   tags=qtag + ['query_type:AAAA'])
-        self.count('dns.queries.type_ptr',   stats.get('q_TypePtr', 0),    tags=qtag + ['query_type:PTR'])
-        self.count('dns.queries.type_mx',    stats.get('q_TypeMx', 0),     tags=qtag + ['query_type:MX'])
-        self.count('dns.queries.type_srv',   stats.get('q_TypeSrv', 0),    tags=qtag + ['query_type:SRV'])
-        self.count('dns.queries.type_ns',    stats.get('q_TypeNs', 0),     tags=qtag + ['query_type:NS'])
-        self.count('dns.queries.type_txt',   stats.get('q_TypeTxt', 0),    tags=qtag + ['query_type:TXT'])
-        self.count('dns.queries.type_soa',   stats.get('q_TypeSoa', 0),    tags=qtag + ['query_type:SOA'])
-        self.count('dns.queries.type_other', stats.get('q_TypeOther', 0),  tags=qtag + ['query_type:OTHER'])
-        self.count('dns.queries.update',     stats.get('q_Update', 0),     tags=qtag + ['query_type:UPDATE'])
+        self.count(f'{METRIC_PREFIX}.queries.total',      total_queries,               tags=qtag + ['query_type:ALL'])
+        self.count(f'{METRIC_PREFIX}.queries.type_a',     stats.get('q_TypeA', 0),     tags=qtag + ['query_type:A'])
+        self.count(f'{METRIC_PREFIX}.queries.type_aaaa',  stats.get('q_TypeAaaa', 0),  tags=qtag + ['query_type:AAAA'])
+        self.count(f'{METRIC_PREFIX}.queries.type_ptr',   stats.get('q_TypePtr', 0),   tags=qtag + ['query_type:PTR'])
+        self.count(f'{METRIC_PREFIX}.queries.type_mx',    stats.get('q_TypeMx', 0),    tags=qtag + ['query_type:MX'])
+        self.count(f'{METRIC_PREFIX}.queries.type_srv',   stats.get('q_TypeSrv', 0),   tags=qtag + ['query_type:SRV'])
+        self.count(f'{METRIC_PREFIX}.queries.type_ns',    stats.get('q_TypeNs', 0),    tags=qtag + ['query_type:NS'])
+        self.count(f'{METRIC_PREFIX}.queries.type_txt',   stats.get('q_TypeTxt', 0),   tags=qtag + ['query_type:TXT'])
+        self.count(f'{METRIC_PREFIX}.queries.type_soa',   stats.get('q_TypeSoa', 0),   tags=qtag + ['query_type:SOA'])
+        self.count(f'{METRIC_PREFIX}.queries.type_other', stats.get('q_TypeOther', 0), tags=qtag + ['query_type:OTHER'])
+        self.count(f'{METRIC_PREFIX}.queries.update',     stats.get('q_Update', 0),    tags=qtag + ['query_type:UPDATE'])
         n += 11
 
         # Error breakdown
         etag = tags + ['category:errors']
-        nx  = float(stats.get('e_NxDomain', 0))
-        sf  = float(stats.get('e_ServFail', 0))
-        rf  = float(stats.get('e_Refused', 0))
-        fe  = float(stats.get('e_FormError', 0))
-        ni  = float(stats.get('e_NotImpl', 0))
-        nr  = float(stats.get('e_NxRRSet', 0))
-        tot = nx + sf + rf + fe + ni + nr
-        self.count('dns.errors.nxdomain_total',  nx,  tags=etag + ['error_type:nxdomain'])
-        self.count('dns.errors.servfail_total',  sf,  tags=etag + ['error_type:servfail'])
-        self.count('dns.errors.refused_total',   rf,  tags=etag + ['error_type:refused'])
-        self.count('dns.errors.formerror_total', fe,  tags=etag + ['error_type:formerror'])
-        self.count('dns.errors.notimpl_total',   ni,  tags=etag + ['error_type:notimpl'])
-        self.count('dns.errors.nxrrset_total',   nr,  tags=etag + ['error_type:nxrrset'])
-        self.count('dns.errors.total',           tot, tags=etag)
+        nx   = float(stats.get('e_NxDomain', 0))
+        sf   = float(stats.get('e_ServFail', 0))
+        rf   = float(stats.get('e_Refused', 0))
+        fe   = float(stats.get('e_FormError', 0))
+        ni   = float(stats.get('e_NotImpl', 0))
+        nr   = float(stats.get('e_NxRRSet', 0))
+        tot  = nx + sf + rf + fe + ni + nr
+        self.count(f'{METRIC_PREFIX}.errors.nxdomain_total',  nx,  tags=etag + ['error_type:nxdomain'])
+        self.count(f'{METRIC_PREFIX}.errors.servfail_total',  sf,  tags=etag + ['error_type:servfail'])
+        self.count(f'{METRIC_PREFIX}.errors.refused_total',   rf,  tags=etag + ['error_type:refused'])
+        self.count(f'{METRIC_PREFIX}.errors.formerror_total', fe,  tags=etag + ['error_type:formerror'])
+        self.count(f'{METRIC_PREFIX}.errors.notimpl_total',   ni,  tags=etag + ['error_type:notimpl'])
+        self.count(f'{METRIC_PREFIX}.errors.nxrrset_total',   nr,  tags=etag + ['error_type:nxrrset'])
+        self.count(f'{METRIC_PREFIX}.errors.total',           tot, tags=etag)
         if total_queries > 0:
-            self.gauge('dns.errors.error_rate_pct', round(tot / total_queries * 100, 4), tags=etag)
+            self.gauge(f'{METRIC_PREFIX}.errors.error_rate_pct', round(tot / total_queries * 100, 4), tags=etag)
             n += 1
         n += 7
 
         # Recursion
-        rtag = tags + ['category:recursion']
+        rtag     = tags + ['category:recursion']
         recursed = float(stats.get('r_QueriesRecursed', 0))
-        self.count('dns.recursion.queries_recursed_total',  recursed,                              tags=rtag)
-        self.count('dns.recursion.forwarded_queries_total', stats.get('r_Forwards', 0),            tags=rtag)
-        self.count('dns.recursion.failures_total',          stats.get('r_RecursionFailure', 0),    tags=rtag)
-        self.count('dns.recursion.timeouts_total',          stats.get('r_TimedoutQueries', 0),     tags=rtag)
-        self.count('dns.recursion.responses_total',         stats.get('r_Responses', 0),           tags=rtag)
-        self.count('dns.recursion.retries_total',           stats.get('r_Retries', 0),             tags=rtag)
-        self.count('dns.recursion.duplicate_queries_total', stats.get('r_DuplicateCoalesedQueries', 0), tags=rtag)
-        self.count('dns.recursion.lookaside_nxdata_total',  stats.get('r_ServerNotAuthNoData', 0), tags=rtag)
+        self.count(f'{METRIC_PREFIX}.recursion.queries_recursed_total',  recursed,                                   tags=rtag)
+        self.count(f'{METRIC_PREFIX}.recursion.forwarded_queries_total', stats.get('r_Forwards', 0),                 tags=rtag)
+        self.count(f'{METRIC_PREFIX}.recursion.failures_total',          stats.get('r_RecursionFailure', 0),         tags=rtag)
+        self.count(f'{METRIC_PREFIX}.recursion.timeouts_total',          stats.get('r_TimedoutQueries', 0),          tags=rtag)
+        self.count(f'{METRIC_PREFIX}.recursion.responses_total',         stats.get('r_Responses', 0),                tags=rtag)
+        self.count(f'{METRIC_PREFIX}.recursion.retries_total',           stats.get('r_Retries', 0),                  tags=rtag)
+        self.count(f'{METRIC_PREFIX}.recursion.duplicate_queries_total', stats.get('r_DuplicateCoalesedQueries', 0), tags=rtag)
+        self.count(f'{METRIC_PREFIX}.recursion.lookaside_nxdata_total',  stats.get('r_ServerNotAuthNoData', 0),      tags=rtag)
         if total_queries > 0:
-            self.gauge('dns.recursion.recursive_ratio_pct',
-                       round(recursed / total_queries * 100, 4), tags=rtag)
+            self.gauge(f'{METRIC_PREFIX}.recursion.recursive_ratio_pct', round(recursed / total_queries * 100, 4), tags=rtag)
             n += 1
         n += 8
 
         # Cache
-        ctag = tags + ['category:cache']
+        ctag          = tags + ['category:cache']
         cache_current = float(stats.get('c_CacheCurrent', 0))
-        self.gauge('dns.cache.records_current', cache_current,                  tags=ctag)
-        self.gauge('dns.cache.records_in_use',  stats.get('c_InUse', 0),        tags=ctag)
-        self.gauge('dns.cache.memory_kb',       stats.get('c_Memory', 0),       tags=ctag + ['memory_source:statistics'])
-        self.count('dns.cache.returned_total',  stats.get('c_Return', 0),       tags=ctag)
-        self.count('dns.cache.timeouts_total',  stats.get('c_CacheTimeouts', 0), tags=ctag)
+        self.gauge(f'{METRIC_PREFIX}.cache.records_current', cache_current,                   tags=ctag)
+        self.gauge(f'{METRIC_PREFIX}.cache.records_in_use',  stats.get('c_InUse', 0),         tags=ctag)
+        self.gauge(f'{METRIC_PREFIX}.cache.memory_kb',       stats.get('c_Memory', 0),        tags=ctag + ['memory_source:statistics'])
+        self.count(f'{METRIC_PREFIX}.cache.returned_total',  stats.get('c_Return', 0),        tags=ctag)
+        self.count(f'{METRIC_PREFIX}.cache.timeouts_total',  stats.get('c_CacheTimeouts', 0), tags=ctag)
         hits = total_queries - recursed
         if total_queries > 0 and hits >= 0:
-            self.gauge('dns.cache.hit_ratio_pct', round(max(0, hits) / total_queries * 100, 4), tags=ctag)
+            self.gauge(f'{METRIC_PREFIX}.cache.hit_ratio_pct', round(max(0, hits) / total_queries * 100, 4), tags=ctag)
             n += 1
         n += 5
 
@@ -540,40 +564,40 @@ class DnsMonitorCheck(AgentCheck):
         ref  = float(stats.get('u_Refused', 0))
         tout = float(stats.get('u_Timeout', 0))
         dsw  = float(stats.get('u_DsWriteFailure', 0))
-        self.count('dns.updates.received_total',         stats.get('u_Received', 0),      tags=utag)
-        self.count('dns.updates.completed_total',        stats.get('u_Completed', 0),     tags=utag)
-        self.count('dns.updates.failed_total',           rej + ref + tout + dsw,          tags=utag)
-        self.count('dns.updates.rejected_total',         rej,                             tags=utag)
-        self.count('dns.updates.secure_success_total',   stats.get('u_SecureSuccess', 0), tags=utag)
-        self.count('dns.updates.secure_failure_total',   stats.get('u_SecureFailure', 0), tags=utag)
-        self.count('dns.updates.queued_total',           stats.get('u_Queued', 0),        tags=utag)
-        self.count('dns.updates.ds_write_failure_total', dsw,                             tags=utag)
+        self.count(f'{METRIC_PREFIX}.updates.received_total',         stats.get('u_Received', 0),      tags=utag)
+        self.count(f'{METRIC_PREFIX}.updates.completed_total',        stats.get('u_Completed', 0),     tags=utag)
+        self.count(f'{METRIC_PREFIX}.updates.failed_total',           rej + ref + tout + dsw,          tags=utag)
+        self.count(f'{METRIC_PREFIX}.updates.rejected_total',         rej,                             tags=utag)
+        self.count(f'{METRIC_PREFIX}.updates.secure_success_total',   stats.get('u_SecureSuccess', 0), tags=utag)
+        self.count(f'{METRIC_PREFIX}.updates.secure_failure_total',   stats.get('u_SecureFailure', 0), tags=utag)
+        self.count(f'{METRIC_PREFIX}.updates.queued_total',           stats.get('u_Queued', 0),        tags=utag)
+        self.count(f'{METRIC_PREFIX}.updates.ds_write_failure_total', dsw,                             tags=utag)
         n += 8
 
         # Security
         sectag = tags + ['category:security']
-        self.count('dns.security.tsig_verify_success_total', stats.get('s_TSigVerifySuccess', 0),  tags=sectag)
-        self.count('dns.security.tsig_verify_failed_total',  stats.get('s_TSigVerifyFailed', 0),   tags=sectag)
-        self.count('dns.security.tkey_invalid_total',        stats.get('s_TKeyInvalid', 0),        tags=sectag)
-        self.count('dns.security.context_timeout_total',     stats.get('s_ContextTimeout', 0),     tags=sectag)
-        self.gauge('dns.security.context_queue_length',      stats.get('s_ContextQueueLength', 0), tags=sectag)
+        self.count(f'{METRIC_PREFIX}.security.tsig_verify_success_total', stats.get('s_TSigVerifySuccess', 0),  tags=sectag)
+        self.count(f'{METRIC_PREFIX}.security.tsig_verify_failed_total',  stats.get('s_TSigVerifyFailed', 0),   tags=sectag)
+        self.count(f'{METRIC_PREFIX}.security.tkey_invalid_total',        stats.get('s_TKeyInvalid', 0),        tags=sectag)
+        self.count(f'{METRIC_PREFIX}.security.context_timeout_total',     stats.get('s_ContextTimeout', 0),     tags=sectag)
+        self.gauge(f'{METRIC_PREFIX}.security.context_queue_length',      stats.get('s_ContextQueueLength', 0), tags=sectag)
         n += 5
 
         # DNSSEC
         dtag = tags + ['category:dnssec']
-        self.count('dns.dnssec.validation_success_total',     stats.get('d_ValidationSuccess', 0),    tags=dtag)
-        self.count('dns.dnssec.validation_failure_total',     stats.get('d_ValidationFailure', 0),    tags=dtag)
-        self.count('dns.dnssec.bad_signature_total',          stats.get('d_BadSignature', 0),         tags=dtag)
-        self.count('dns.dnssec.no_signature_total',           stats.get('d_NoSignature', 0),          tags=dtag)
-        self.count('dns.dnssec.bogus_total',                  stats.get('d_BogusTotal', 0),           tags=dtag)
-        self.count('dns.dnssec.timestamp_out_of_range_total', stats.get('d_TimestampOutOfRange', 0),  tags=dtag)
-        self.count('dns.dnssec.algorithm_unsupported_total',  stats.get('d_AlgorithmUnsupported', 0), tags=dtag)
+        self.count(f'{METRIC_PREFIX}.dnssec.validation_success_total',     stats.get('d_ValidationSuccess', 0),    tags=dtag)
+        self.count(f'{METRIC_PREFIX}.dnssec.validation_failure_total',     stats.get('d_ValidationFailure', 0),    tags=dtag)
+        self.count(f'{METRIC_PREFIX}.dnssec.bad_signature_total',          stats.get('d_BadSignature', 0),         tags=dtag)
+        self.count(f'{METRIC_PREFIX}.dnssec.no_signature_total',           stats.get('d_NoSignature', 0),          tags=dtag)
+        self.count(f'{METRIC_PREFIX}.dnssec.bogus_total',                  stats.get('d_BogusTotal', 0),           tags=dtag)
+        self.count(f'{METRIC_PREFIX}.dnssec.timestamp_out_of_range_total', stats.get('d_TimestampOutOfRange', 0),  tags=dtag)
+        self.count(f'{METRIC_PREFIX}.dnssec.algorithm_unsupported_total',  stats.get('d_AlgorithmUnsupported', 0), tags=dtag)
         n += 7
 
         # Memory (statistics source)
         mem_bytes = float(stats.get('m_Memory', 0))
         if mem_bytes > 0:
-            self.gauge('dns.process.memory_mb',
+            self.gauge(f'{METRIC_PREFIX}.process.memory_mb',
                        round(mem_bytes / 1024 / 1024, 2),
                        tags=tags + ['category:process', 'process:dns', 'memory_source:statistics'])
             n += 1
@@ -582,18 +606,16 @@ class DnsMonitorCheck(AgentCheck):
 
     # ── 4. Forwarder availability ──────────────────────────────────────────────
     def _detect_forwarders(self) -> List[str]:
-        """Auto-detect forwarder IPs via PowerShell."""
         out = _ps(
             "(Get-DnsServerForwarder -ErrorAction SilentlyContinue).IPAddress | "
             "ForEach-Object { $_.ToString() } | Where-Object { $_ -and $_.Trim() }"
         )
         ips = [l.strip() for l in out.splitlines() if l.strip()]
         if ips:
-            self.log.info(f'[dns_monitor] auto-detected forwarders: {ips}')
+            self.log.info(f'[zg_dns_monitor] auto-detected forwarders: {ips}')
         return ips
 
     def _get_forwarder_server_info(self) -> Tuple[int, int]:
-        """Returns (use_root_hint 0/1, timeout_sec)."""
         out = _ps(r"""
 $f = Get-DnsServerForwarder -ErrorAction SilentlyContinue
 if ($null -eq $f) { Write-Output '0|0'; exit }
@@ -616,17 +638,17 @@ Write-Output "$rh|$to"
         n = 0
 
         use_root_hint, timeout_sec = self._get_forwarder_server_info()
-        self.gauge('dns.forwarders.configured_count', len(forwarders), tags=ftags)
-        self.gauge('dns.forwarders.use_root_hint',    use_root_hint,   tags=ftags)
-        self.gauge('dns.forwarders.timeout_sec',      timeout_sec,     tags=ftags)
+        self.gauge(f'{METRIC_PREFIX}.forwarders.configured_count', len(forwarders), tags=ftags)
+        self.gauge(f'{METRIC_PREFIX}.forwarders.use_root_hint',    use_root_hint,   tags=ftags)
+        self.gauge(f'{METRIC_PREFIX}.forwarders.timeout_sec',      timeout_sec,     tags=ftags)
         n += 3
 
         if not forwarders:
-            self.gauge('dns.forwarders.available_count', 0, tags=ftags)
-            self.gauge('dns.forwarders.degraded_count',  0, tags=ftags)
+            self.gauge(f'{METRIC_PREFIX}.forwarders.available_count', 0, tags=ftags)
+            self.gauge(f'{METRIC_PREFIX}.forwarders.degraded_count',  0, tags=ftags)
             return n + 2
 
-        avail_count = 0
+        avail_count  = 0
         best_latency: Optional[float] = None
 
         for ip in forwarders:
@@ -634,7 +656,6 @@ Write-Output "$rh|$to"
             subnet = f'{parts[0]}.{parts[1]}.{parts[2]}.0/24' if len(parts) == 4 else ip
             itags  = ftags + [f'forwarder_ip:{ip}', f'forwarder_subnet:{subnet}']
 
-            # DNS probe (primary)
             up, latency_ms = _probe_dns(ip, probe_domain, timeout)
             avail_val = 1 if up else 0
             if up:
@@ -642,11 +663,10 @@ Write-Output "$rh|$to"
                 if best_latency is None or latency_ms < best_latency:
                     best_latency = latency_ms
 
-            self.gauge('dns.forwarders.availability',    avail_val,  tags=itags)
-            self.gauge('dns.forwarders.probe_latency_ms', latency_ms, tags=itags)
+            self.gauge(f'{METRIC_PREFIX}.forwarders.availability',     avail_val,  tags=itags)
+            self.gauge(f'{METRIC_PREFIX}.forwarders.probe_latency_ms', latency_ms, tags=itags)
             n += 2
 
-            # TCP/53 secondary
             tcp_up = 0
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -656,72 +676,61 @@ Write-Output "$rh|$to"
                 tcp_up = 1
             except Exception:
                 pass
-            self.gauge('dns.forwarders.tcp_reachable', tcp_up, tags=itags)
-            n += 1
-
-            # Resolver broken: TCP up but DNS failing
-            resolver_broken = 1 if (not up and tcp_up) else 0
-            self.gauge('dns.forwarders.resolver_broken', resolver_broken, tags=itags)
-            n += 1
+            self.gauge(f'{METRIC_PREFIX}.forwarders.tcp_reachable',    tcp_up,                       tags=itags)
+            self.gauge(f'{METRIC_PREFIX}.forwarders.resolver_broken',  1 if (not up and tcp_up) else 0, tags=itags)
+            n += 2
 
         degraded = len(forwarders) - avail_count
-        self.gauge('dns.forwarders.available_count', avail_count, tags=ftags)
-        self.gauge('dns.forwarders.degraded_count',  degraded,    tags=ftags)
-        n += 2
-
-        if forwarders:
-            pct = avail_count / len(forwarders) * 100
-            self.gauge('dns.forwarders.availability_pct', pct, tags=ftags)
-            n += 1
+        self.gauge(f'{METRIC_PREFIX}.forwarders.available_count',    avail_count, tags=ftags)
+        self.gauge(f'{METRIC_PREFIX}.forwarders.degraded_count',     degraded,    tags=ftags)
+        self.gauge(f'{METRIC_PREFIX}.forwarders.availability_pct',   avail_count / len(forwarders) * 100, tags=ftags)
+        n += 3
 
         if best_latency is not None:
-            self.gauge('dns.forwarders.best_probe_latency_ms', best_latency, tags=ftags)
+            self.gauge(f'{METRIC_PREFIX}.forwarders.best_probe_latency_ms', best_latency, tags=ftags)
             n += 1
 
         return n
 
-    # ── 5. Resolution response time ───────────────────────────────────────────
+    # ── 5. Resolution response time (per-domain) ──────────────────────────────
     def _collect_resolution(self, tags: List[str], probe_domain: str,
                              warn_ms: float, crit_ms: float) -> int:
         n = 0
-        probe_count = 0
+        domain_tag = probe_domain.replace(':', '_').replace(' ', '_')
 
         # Baseline: raw UDP/53 probe to 127.0.0.1
-        rtags = tags + ['category:resolution', 'probe_scope:baseline', 'zone:_baseline']
+        rtags = tags + ['category:resolution', 'probe_scope:baseline', f'zone:{domain_tag}']
         up, ms = _probe_dns('127.0.0.1', probe_domain, timeout=5.0)
-        probe_count += 1
 
-        self.gauge('dns.resolution.status', 1 if up else 0, tags=rtags)
-        self.gauge('dns.resolution.latency_ms', ms, tags=rtags)
+        self.gauge(f'{METRIC_PREFIX}.resolution.up',         1 if up else 0, tags=rtags)
+        self.gauge(f'{METRIC_PREFIX}.resolution.latency_ms', ms,             tags=rtags)
         n += 2
 
         sc = AgentCheck.CRITICAL
         if up:
-            sc = AgentCheck.OK if ms <= warn_ms else (AgentCheck.WARNING if ms <= crit_ms else AgentCheck.CRITICAL)
-        self.gauge('dns.resolution.service_check', sc, tags=rtags)
-        self.service_check('dns.resolution.latency',
-                           sc, tags=rtags,
-                           message=f'Resolution latency {ms:.1f}ms')
+            sc = AgentCheck.OK if ms <= warn_ms else (
+                AgentCheck.WARNING if ms <= crit_ms else AgentCheck.CRITICAL)
+        self.gauge(f'{METRIC_PREFIX}.resolution.service_check', sc, tags=rtags)
+        self.service_check(
+            f'{METRIC_PREFIX}.resolution.latency',
+            sc,
+            tags=rtags,
+            message=f'[{probe_domain}] Resolution latency {ms:.1f}ms',
+        )
         n += 1
 
-        # External probe: full recursive resolution via net resolver
-        if probe_domain:
-            etags = tags + ['category:resolution', 'probe_scope:external']
-            probe_count += 1
-            try:
-                t0 = time.monotonic()
-                socket.getaddrinfo(probe_domain, None)
-                ext_ms = (time.monotonic() - t0) * 1000
-                self.gauge('dns.resolution.status', 1, tags=etags)
-                self.gauge('dns.resolution.latency_ms', round(ext_ms, 2), tags=etags)
-            except Exception:
-                self.gauge('dns.resolution.status', 0, tags=etags)
-                self.gauge('dns.resolution.latency_ms', 0, tags=etags)
-            n += 2
-
-        self.gauge('dns.resolution.internal_probe_targets', probe_count,
-                   tags=tags + ['category:resolution'])
-        n += 1
+        # External probe: full recursive resolution via OS resolver
+        etags = tags + ['category:resolution', 'probe_scope:external', f'zone:{domain_tag}']
+        try:
+            t0 = time.monotonic()
+            socket.getaddrinfo(probe_domain, None)
+            ext_ms = (time.monotonic() - t0) * 1000
+            self.gauge(f'{METRIC_PREFIX}.resolution.up',         1,                 tags=etags)
+            self.gauge(f'{METRIC_PREFIX}.resolution.latency_ms', round(ext_ms, 2), tags=etags)
+        except Exception:
+            self.gauge(f'{METRIC_PREFIX}.resolution.up',         0, tags=etags)
+            self.gauge(f'{METRIC_PREFIX}.resolution.latency_ms', 0, tags=etags)
+        n += 2
 
         return n
 
@@ -741,27 +750,27 @@ Get-DnsServerZone -ErrorAction SilentlyContinue |
         if raw and raw != 'null':
             try:
                 parsed = json.loads(raw)
-                zones = parsed if isinstance(parsed, list) else [parsed]
+                zones  = parsed if isinstance(parsed, list) else [parsed]
             except Exception as e:
-                self.log.warning(f'[dns_monitor] zone JSON parse failed: {e}')
+                self.log.warning(f'[zg_dns_monitor] zone JSON parse failed: {e}')
 
-        total      = len(zones)
-        forward    = sum(1 for z in zones if not z.get('IsReverseLookupZone'))
-        reverse    = sum(1 for z in zones if z.get('IsReverseLookupZone'))
-        primary    = sum(1 for z in zones if z.get('ZoneType') == 'Primary')
-        secondary  = sum(1 for z in zones if z.get('ZoneType') == 'Secondary')
-        stub       = sum(1 for z in zones if z.get('ZoneType') == 'Stub')
-        ad_int     = sum(1 for z in zones if z.get('IsDsIntegrated'))
-        signed     = sum(1 for z in zones if z.get('IsSigned'))
+        total     = len(zones)
+        forward   = sum(1 for z in zones if not z.get('IsReverseLookupZone'))
+        reverse   = sum(1 for z in zones if z.get('IsReverseLookupZone'))
+        primary   = sum(1 for z in zones if z.get('ZoneType') == 'Primary')
+        secondary = sum(1 for z in zones if z.get('ZoneType') == 'Secondary')
+        stub      = sum(1 for z in zones if z.get('ZoneType') == 'Stub')
+        ad_int    = sum(1 for z in zones if z.get('IsDsIntegrated'))
+        signed    = sum(1 for z in zones if z.get('IsSigned'))
 
-        self.gauge('dns.zones.total_count',         total,     tags=ztags)
-        self.gauge('dns.zones.forward_count',       forward,   tags=ztags)
-        self.gauge('dns.zones.reverse_count',       reverse,   tags=ztags)
-        self.gauge('dns.zones.primary_count',       primary,   tags=ztags)
-        self.gauge('dns.zones.secondary_count',     secondary, tags=ztags)
-        self.gauge('dns.zones.stub_count',          stub,      tags=ztags)
-        self.gauge('dns.zones.ad_integrated_count', ad_int,    tags=ztags)
-        self.gauge('dns.zones.dnssec_signed_count', signed,    tags=ztags)
+        self.gauge(f'{METRIC_PREFIX}.zones.total_count',         total,     tags=ztags)
+        self.gauge(f'{METRIC_PREFIX}.zones.forward_count',       forward,   tags=ztags)
+        self.gauge(f'{METRIC_PREFIX}.zones.reverse_count',       reverse,   tags=ztags)
+        self.gauge(f'{METRIC_PREFIX}.zones.primary_count',       primary,   tags=ztags)
+        self.gauge(f'{METRIC_PREFIX}.zones.secondary_count',     secondary, tags=ztags)
+        self.gauge(f'{METRIC_PREFIX}.zones.stub_count',          stub,      tags=ztags)
+        self.gauge(f'{METRIC_PREFIX}.zones.ad_integrated_count', ad_int,    tags=ztags)
+        self.gauge(f'{METRIC_PREFIX}.zones.dnssec_signed_count', signed,    tags=ztags)
         n += 8
 
         for z in zones:
@@ -770,24 +779,18 @@ Get-DnsServerZone -ErrorAction SilentlyContinue |
                 continue
             ztype = (z.get('ZoneType') or 'unknown').lower()
             ztper = tags + ['category:zones', f'zone:{zname}', f'zone_type:{ztype}']
-            self.gauge('dns.zones.is_paused',     1 if z.get('IsPaused')      else 0, tags=ztper)
-            self.gauge('dns.zones.ad_integrated', 1 if z.get('IsDsIntegrated') else 0, tags=ztper)
-            self.gauge('dns.zones.dnssec_signed', 1 if z.get('IsSigned')       else 0, tags=ztper)
+            self.gauge(f'{METRIC_PREFIX}.zones.is_paused',     1 if z.get('IsPaused')       else 0, tags=ztper)
+            self.gauge(f'{METRIC_PREFIX}.zones.ad_integrated', 1 if z.get('IsDsIntegrated') else 0, tags=ztper)
+            self.gauge(f'{METRIC_PREFIX}.zones.dnssec_signed', 1 if z.get('IsSigned')       else 0, tags=ztper)
             n += 3
 
         return n
 
     # ── 7. Process metrics ─────────────────────────────────────────────────────
     def _collect_process(self, tags: List[str]) -> int:
-        """
-        Collect dns.exe process metrics via PowerShell Get-Process.
-        PowerShell subprocess works under all Agent user contexts.
-        WMI Win32_Process is unreliable when called from restricted service accounts.
-        """
         ptags = tags + ['category:process', 'process:dns']
         n = 0
 
-        # Primary: PowerShell Get-Process (works under Agent service account)
         raw = _ps(r"""
 $p = Get-Process -Name dns -ErrorAction SilentlyContinue
 if ($null -eq $p) { Write-Output 'null'; exit }
@@ -807,24 +810,22 @@ try { $uptime = [math]::Round(((Get-Date) - $p.StartTime).TotalMinutes, 2) } cat
 
         if raw and raw != 'null':
             try:
-                import json as _json
-                d = _json.loads(raw)
-                self.gauge('dns.process.working_set_mb', float(d.get('WorkingSetMB', 0)), tags=ptags + ['memory_source:working_set'])
-                self.gauge('dns.process.private_mem_mb', float(d.get('PrivateMemMB',  0)), tags=ptags + ['memory_source:private'])
-                self.gauge('dns.process.virtual_mem_mb', float(d.get('VirtualMemMB',  0)), tags=ptags + ['memory_source:virtual'])
-                self.gauge('dns.process.thread_count',   int(d.get('ThreadCount',   0)),   tags=ptags)
-                self.gauge('dns.process.handle_count',   int(d.get('HandleCount',   0)),   tags=ptags)
-                self.count('dns.process.io_read_ops_total',  float(d.get('IoReadOps',  0)), tags=ptags)
-                self.count('dns.process.io_write_ops_total', float(d.get('IoWriteOps', 0)), tags=ptags)
+                d = json.loads(raw)
+                self.gauge(f'{METRIC_PREFIX}.process.working_set_mb', float(d.get('WorkingSetMB', 0)), tags=ptags + ['memory_source:working_set'])
+                self.gauge(f'{METRIC_PREFIX}.process.private_mem_mb', float(d.get('PrivateMemMB',  0)), tags=ptags + ['memory_source:private'])
+                self.gauge(f'{METRIC_PREFIX}.process.virtual_mem_mb', float(d.get('VirtualMemMB',  0)), tags=ptags + ['memory_source:virtual'])
+                self.gauge(f'{METRIC_PREFIX}.process.thread_count',   int(d.get('ThreadCount',   0)),   tags=ptags)
+                self.gauge(f'{METRIC_PREFIX}.process.handle_count',   int(d.get('HandleCount',   0)),   tags=ptags)
+                self.count(f'{METRIC_PREFIX}.process.io_read_ops_total',  float(d.get('IoReadOps',  0)), tags=ptags)
+                self.count(f'{METRIC_PREFIX}.process.io_write_ops_total', float(d.get('IoWriteOps', 0)), tags=ptags)
                 n += 7
                 uptime = float(d.get('UptimeMinutes', -1))
                 if uptime >= 0:
-                    self.gauge('dns.process.uptime_minutes', uptime, tags=ptags)
+                    self.gauge(f'{METRIC_PREFIX}.process.uptime_minutes', uptime, tags=ptags)
                     n += 1
             except Exception as e:
-                self.log.warning(f'[dns_monitor] process JSON parse failed: {e}')
+                self.log.warning(f'[zg_dns_monitor] process JSON parse failed: {e}')
 
-        # CPU % via typeperf (same approach as perfmon — works under Agent context)
         if PYWIN32_OK:
             try:
                 q = win32pdh.OpenQuery()
@@ -834,7 +835,7 @@ try { $uptime = [math]::Round(((Get-Date) - $p.StartTime).TotalMinutes, 2) } cat
                 win32pdh.CollectQueryData(q)
                 _, cpu = win32pdh.GetFormattedCounterValue(h, win32pdh.PDH_FMT_DOUBLE)
                 win32pdh.CloseQuery(q)
-                self.gauge('dns.process.cpu_pct', float(cpu), tags=ptags)
+                self.gauge(f'{METRIC_PREFIX}.process.cpu_pct', float(cpu), tags=ptags)
                 n += 1
             except Exception:
                 pass
@@ -851,8 +852,8 @@ $cutoff = (Get-Date).AddMinutes(-{lookback_minutes})
 try {{
     $evts = Get-WinEvent -FilterHashtable @{{LogName='DNS Server';StartTime=$cutoff}} `
             -MaxEvents 500 -ErrorAction Stop
-    $err  = @($evts | Where-Object {{ $_.LevelDisplayName -eq 'Error'   }}).Count
-    $warn = @($evts | Where-Object {{ $_.LevelDisplayName -eq 'Warning' }}).Count
+    $err  = @($evts | Where-Object {{ $_.LevelDisplayName -eq 'Error'       }}).Count
+    $warn = @($evts | Where-Object {{ $_.LevelDisplayName -eq 'Warning'     }}).Count
     $info = @($evts | Where-Object {{ $_.LevelDisplayName -eq 'Information' }}).Count
     $cap  = if ($evts.Count -ge 500) {{ 1 }} else {{ 0 }}
     Write-Output "$err|$warn|$info|$cap"
@@ -869,17 +870,17 @@ try {{
             parts = raw.split('|')
             if len(parts) == 4:
                 try:
-                    self.gauge('dns.events.errors_in_window',        int(parts[0]), tags=etags + ['level:error'])
-                    self.gauge('dns.events.warnings_in_window',      int(parts[1]), tags=etags + ['level:warning'])
-                    self.gauge('dns.events.info_in_window',          int(parts[2]), tags=etags + ['level:info'])
-                    self.gauge('dns.events.cap_reached',             int(parts[3]), tags=etags)
-                    self.gauge('dns.events.lookback_window_minutes', lookback_minutes, tags=etags)
+                    self.gauge(f'{METRIC_PREFIX}.events.errors_in_window',        int(parts[0]), tags=etags + ['level:error'])
+                    self.gauge(f'{METRIC_PREFIX}.events.warnings_in_window',      int(parts[1]), tags=etags + ['level:warning'])
+                    self.gauge(f'{METRIC_PREFIX}.events.info_in_window',          int(parts[2]), tags=etags + ['level:info'])
+                    self.gauge(f'{METRIC_PREFIX}.events.cap_reached',             int(parts[3]), tags=etags)
+                    self.gauge(f'{METRIC_PREFIX}.events.lookback_window_minutes', lookback_minutes, tags=etags)
                     n += 5
                 except ValueError:
                     pass
         else:
-            self.gauge('dns.events.errors_in_window',   0, tags=etags + ['level:error'])
-            self.gauge('dns.events.warnings_in_window', 0, tags=etags + ['level:warning'])
+            self.gauge(f'{METRIC_PREFIX}.events.errors_in_window',   0, tags=etags + ['level:error'])
+            self.gauge(f'{METRIC_PREFIX}.events.warnings_in_window', 0, tags=etags + ['level:warning'])
             n += 2
 
         return n
@@ -906,14 +907,13 @@ try {
         parts = (raw or '0|0').split('|')
         if len(parts) == 2:
             try:
-                self.gauge('dns.scavenging.enabled',        int(parts[0]),   tags=stags)
-                self.gauge('dns.scavenging.interval_hours', float(parts[1]), tags=stags)
+                self.gauge(f'{METRIC_PREFIX}.scavenging.enabled',        int(parts[0]),   tags=stags)
+                self.gauge(f'{METRIC_PREFIX}.scavenging.interval_hours', float(parts[1]), tags=stags)
                 n += 2
             except ValueError:
                 pass
 
-        # Monitor UDP send failures (always 0 in Python check — Agent handles retries)
-        self.count('dns.monitor.udp_send_failures_total', 0, tags=tags + ['category:monitor'])
+        self.count(f'{METRIC_PREFIX}.monitor.udp_send_failures_total', 0, tags=tags + ['category:monitor'])
         n += 1
 
         return n
