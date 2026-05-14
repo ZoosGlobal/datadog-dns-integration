@@ -9,11 +9,12 @@
 #
 # ==============================================================================
 #  Script    : Install-ZgDnsMonitor.ps1
-#  Version   : 2.0.0
+#  Version   : 2.1.0
 #  Purpose   : Deploys the Zoos Global DNS Monitor integration for Datadog.
 #              Copies files from the local repository (no internet required),
-#              injects client-specific resolution probe domains into conf.yaml,
 #              backs up any existing files, and optionally restarts the Agent.
+#              All configuration (domains, env, thresholds) is managed directly
+#              in dns_monitor.d\conf.yaml in the repository — no patching here.
 #
 #  Repo layout (paths relative to this script at setup\Install-ZgDnsMonitor.ps1):
 #    ..\dns_moniter.py          →  C:\ProgramData\Datadog\checks.d\dns_monitor.py
@@ -41,19 +42,9 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 # ==============================================================================
-# CONFIGURATION — edit these values per client engagement
+# CONFIGURATION
 # ==============================================================================
 
-# Client-specific resolution probe domains injected into conf.yaml
-$RESOLUTION_DOMAINS = @(
-    "planetexl.exlservice.com",
-    "corp.exlservice.com"
-)
-
-# Environment tag written into conf.yaml
-$ENV_TAG = "production"
-
-# Datadog Agent root and service name
 $DD_ROOT    = "C:\ProgramData\Datadog"
 $DD_SERVICE = "datadogagent"
 
@@ -68,14 +59,14 @@ $DD_SERVICE = "datadogagent"
 $SCRIPT_DIR = Split-Path -Parent $MyInvocation.MyCommand.Definition
 $REPO_ROOT  = Split-Path -Parent $SCRIPT_DIR
 
-# Source files (resolved from repo root — no internet needed)
-$PY_SRC     = Join-Path $REPO_ROOT "dns_moniter.py"           # typo in repo filename is intentional
-$CONF_SRC   = Join-Path $REPO_ROOT "dns_monitor.d\conf.yaml"
+# Source files (from repo — no internet needed)
+$PY_SRC   = Join-Path $REPO_ROOT "dns_moniter.py"
+$CONF_SRC = Join-Path $REPO_ROOT "dns_monitor.d\conf.yaml"
 
 # Destination paths inside the Datadog Agent directory tree
 $CHECKS_DIR = Join-Path $DD_ROOT "checks.d"
 $CONF_DIR   = Join-Path $DD_ROOT "conf.d\dns_monitor.d"
-$PY_DEST    = Join-Path $CHECKS_DIR "dns_monitor.py"           # corrected filename on destination
+$PY_DEST    = Join-Path $CHECKS_DIR "dns_monitor.py"    # corrected filename on destination
 $CONF_DEST  = Join-Path $CONF_DIR   "conf.yaml"
 
 # ==============================================================================
@@ -101,7 +92,7 @@ function Backup-File($path) {
 # BANNER
 # ==============================================================================
 Write-Host ""
-Write-Host "  Zoos Global — DNS Monitor Installer v2.0.0" -ForegroundColor White
+Write-Host "  Zoos Global — DNS Monitor Installer v2.1.0" -ForegroundColor White
 Write-Host "  Datadog checks.d + conf.d deployment (offline)" -ForegroundColor Gray
 Write-Host "  www.zoosglobal.com" -ForegroundColor Gray
 Write-Host ""
@@ -192,47 +183,12 @@ if ((Get-Content $PY_DEST -Raw) -notmatch "class DnsMonitorCheck") {
 Write-OK "Installed and validated: $PY_DEST"
 
 # ==============================================================================
-# STEP 5 : Patch and install conf.d\dns_monitor.d\conf.yaml
+# STEP 5 : Copy conf.d\dns_monitor.d\conf.yaml
 # ==============================================================================
 Write-Step "Installing conf.d\dns_monitor.d\conf.yaml"
 
-# Read into memory for patching — source file is never modified
-$confContent = Get-Content $CONF_SRC -Raw
-
-# ── 5a. Set env tag ───────────────────────────────────────────────────────────
-if ($confContent -match 'env\s*:') {
-    $confContent = $confContent -replace '(?m)^\s*env\s*:.*$', "  env: `"$ENV_TAG`""
-    Write-OK "Set env tag: $ENV_TAG"
-} else {
-    Write-Warn "Could not find 'env:' key in conf.yaml — skipping env injection"
-}
-
-# ── 5b. Build resolution_probe_domains YAML block ────────────────────────────
-$domainLines = $RESOLUTION_DOMAINS | ForEach-Object { "      - `"$_`"" }
-$domainBlock = "      resolution_probe_domains:`n" + ($domainLines -join "`n")
-
-if ($confContent -match '(?ms)\s*resolution_probe_domains\s*:') {
-    # Replace existing multi-domain block
-    $confContent = $confContent -replace '(?ms)([ \t]*)resolution_probe_domains\s*:.*?(?=\n\s{0,6}\S|\z)', $domainBlock
-    Write-OK "Replaced existing resolution_probe_domains block"
-} elseif ($confContent -match '(?m)^\s*resolution_probe_domain\s*:') {
-    # Replace legacy single-domain key
-    $confContent = $confContent -replace '(?m)^\s*resolution_probe_domain\s*:.*$', $domainBlock
-    Write-OK "Replaced legacy resolution_probe_domain with resolution_probe_domains block"
-} else {
-    # Key absent — append
-    $confContent += "`n      # Injected by Install-ZgDnsMonitor.ps1`n$domainBlock`n"
-    Write-OK "Appended resolution_probe_domains (key was absent in template)"
-}
-
-Write-OK "Resolution probe domains configured:"
-foreach ($d in $RESOLUTION_DOMAINS) {
-    Write-Host "           → $d" -ForegroundColor Gray
-}
-
-# ── 5c. Write patched conf.yaml to destination ───────────────────────────────
 Backup-File $CONF_DEST
-[System.IO.File]::WriteAllText($CONF_DEST, $confContent, [System.Text.Encoding]::UTF8)
+Copy-Item -Path $CONF_SRC -Destination $CONF_DEST -Force
 Write-OK "Installed: $CONF_DEST"
 
 # ==============================================================================
@@ -251,15 +207,6 @@ if (Test-Path $PY_DEST) {
 
 if (Test-Path $CONF_DEST) {
     Write-OK "conf.yaml        $((Get-Item $CONF_DEST).Length) bytes  →  $CONF_DEST"
-    $confVerify = Get-Content $CONF_DEST -Raw
-    foreach ($d in $RESOLUTION_DOMAINS) {
-        if ($confVerify -match [regex]::Escape($d)) {
-            Write-OK "  Domain verified: $d"
-        } else {
-            Write-Warn "  Domain NOT found in conf.yaml: $d — inspect file manually"
-            $errors++
-        }
-    }
 } else {
     Write-Fail "conf.yaml        MISSING at $CONF_DEST"
     $errors++
