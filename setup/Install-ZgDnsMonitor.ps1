@@ -4,15 +4,16 @@
 #   ╚══███╔╝██╔═══██╗██╔═══██╗██╔════╝    ██╔════╝ ██║     ██╔═══██╗██╔══██╗██╔══██╗██║
 #     ███╔╝ ██║   ██║██║   ██║███████╗    ██║  ███╗██║     ██║   ██║██████╔╝███████║██║
 #    ███╔╝  ██║   ██║██║   ██║╚════██║    ██║   ██║██║     ██║   ██║██╔══██╗██╔══██║██║
-#   ███████╗╚██████╔╝╚██████╔╝███████║    ╚██████╔╝███████╗╚██████╔╝██████╔╝██║  ██║███████╗
-#   ╚══════╝ ╚═════╝  ╚═════╝ ╚══════╝     ╚═════╝ ╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝
+#   ███████╗╚██████╔╝╚██████╔╝███████║     ╚██████╔╝███████╗╚██████╔╝██████╔╝██║  ██║███████╗
+#   ╚══════╝ ╚═════╝  ╚═════╝ ╚══════╝      ╚═════╝ ╚══════╝ ╚═════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝
 #
 # ==============================================================================
 #  Script    : Install-ZgDnsMonitor.ps1
-#  Version   : 2.1.0
+#  Version   : 2.1.1
 #  Purpose   : Deploys the Zoos Global DNS Monitor integration for Datadog.
 #              Copies files from the local repository (no internet required),
-#              backs up any existing files, and optionally restarts the Agent.
+#              backs up any existing files, restarts the Agent, and creates a
+#              success marker file only when installation completes successfully.
 #              All configuration (domains, env, thresholds) is managed directly
 #              in dns_monitor.d\conf.yaml in the repository -- no patching here.
 #
@@ -27,7 +28,7 @@
 #  Title     : Sr. DevOps Engineer | Engineering
 #  Org       : Zoos Global
 #  Email     : shivam.anand@zoosglobal.com
-#  Web       : www.zoosglobal.com
+#  Web       : https://www.zoosglobal.com
 #  Address   : Violena, Pali Hill, Bandra West, Mumbai - 400050
 # ------------------------------------------------------------------------------
 #  Platform  : Windows Server 2019 / 2022 / 2025
@@ -45,8 +46,9 @@ $ErrorActionPreference = 'Stop'
 # CONFIGURATION
 # ==============================================================================
 
-$DD_ROOT    = "C:\ProgramData\Datadog"
-$DD_SERVICE = "datadogagent"
+$DD_ROOT      = "C:\ProgramData\Datadog"
+$DD_SERVICE   = "datadogagent"
+$SUCCESS_FILE = "C:\temp\dns_integraion.txt"
 
 # ==============================================================================
 # RESOLVE PATHS -- relative to this script's own location
@@ -66,7 +68,7 @@ $CONF_SRC = Join-Path $REPO_ROOT "dns_monitor.d\conf.yaml"
 # Destination paths inside the Datadog Agent directory tree
 $CHECKS_DIR = Join-Path $DD_ROOT "checks.d"
 $CONF_DIR   = Join-Path $DD_ROOT "conf.d\dns_monitor.d"
-$PY_DEST    = Join-Path $CHECKS_DIR "dns_monitor.py"    # corrected filename on destination
+$PY_DEST    = Join-Path $CHECKS_DIR "dns_monitor.py"
 $CONF_DEST  = Join-Path $CONF_DIR   "conf.yaml"
 
 # ==============================================================================
@@ -76,9 +78,15 @@ $CONF_DEST  = Join-Path $CONF_DIR   "conf.yaml"
 function Write-Step($msg) {
     Write-Host "`n[$([char]0x25B6)] $msg" -ForegroundColor Cyan
 }
-function Write-OK($msg)   { Write-Host "  [OK] $msg" -ForegroundColor Green  }
-function Write-Warn($msg) { Write-Host "  [!!] $msg" -ForegroundColor Yellow }
-function Write-Fail($msg) { Write-Host "  [XX] $msg" -ForegroundColor Red    }
+function Write-OK($msg)   {
+    Write-Host "  [OK] $msg" -ForegroundColor Green
+}
+function Write-Warn($msg) {
+    Write-Host "  [!!] $msg" -ForegroundColor Yellow
+}
+function Write-Fail($msg) {
+    Write-Host "  [XX] $msg" -ForegroundColor Red
+}
 
 function Backup-File($path) {
     if (Test-Path $path) {
@@ -92,7 +100,7 @@ function Backup-File($path) {
 # BANNER
 # ==============================================================================
 Write-Host ""
-Write-Host "  Zoos Global -- DNS Monitor Installer v2.1.0" -ForegroundColor White
+Write-Host "  Zoos Global -- DNS Monitor Installer v2.1.1" -ForegroundColor White
 Write-Host "  Datadog checks.d + conf.d deployment (offline)" -ForegroundColor Gray
 Write-Host "  www.zoosglobal.com" -ForegroundColor Gray
 Write-Host ""
@@ -142,14 +150,15 @@ Write-OK "Datadog Agent root found: $DD_ROOT"
 
 $svc = Get-Service -Name $DD_SERVICE -ErrorAction SilentlyContinue
 if (-not $svc) {
-    Write-Warn "Datadog Agent service '$DD_SERVICE' not found -- continuing anyway."
-} else {
-    Write-OK "Datadog Agent service found (status: $($svc.Status))"
+    Write-Fail "Datadog Agent service '$DD_SERVICE' not found."
+    Write-Fail "Install the Datadog Agent service before running this script."
+    exit 1
 }
+Write-OK "Datadog Agent service found (status: $($svc.Status))"
 
 $statsd = netstat -an | Select-String "8125"
 if ($statsd) {
-    Write-OK "DogStatsD is listening on port 8125"
+    Write-OK "DogStatsD activity detected on port 8125"
 } else {
     Write-Warn "DogStatsD not detected on port 8125 -- verify dogstatsd_port: 8125 in datadog.yaml"
 }
@@ -176,6 +185,11 @@ Write-Step "Installing checks.d\dns_monitor.py"
 Backup-File $PY_DEST
 Copy-Item -Path $PY_SRC -Destination $PY_DEST -Force
 
+if (-not (Test-Path $PY_DEST)) {
+    Write-Fail "dns_monitor.py was not copied to $PY_DEST"
+    exit 1
+}
+
 if ((Get-Content $PY_DEST -Raw) -notmatch "class DnsMonitorCheck") {
     Write-Fail "Installed dns_monitor.py does not look valid (DnsMonitorCheck class not found)"
     exit 1
@@ -189,6 +203,11 @@ Write-Step "Installing conf.d\dns_monitor.d\conf.yaml"
 
 Backup-File $CONF_DEST
 Copy-Item -Path $CONF_SRC -Destination $CONF_DEST -Force
+
+if (-not (Test-Path $CONF_DEST)) {
+    Write-Fail "conf.yaml was not copied to $CONF_DEST"
+    exit 1
+}
 Write-OK "Installed: $CONF_DEST"
 
 # ==============================================================================
@@ -199,14 +218,26 @@ Write-Step "Verifying installed files"
 $errors = 0
 
 if (Test-Path $PY_DEST) {
-    Write-OK "dns_monitor.py   $((Get-Item $PY_DEST).Length) bytes  ->  $PY_DEST"
+    $pySize = (Get-Item $PY_DEST).Length
+    if ($pySize -gt 0) {
+        Write-OK "dns_monitor.py   $pySize bytes  ->  $PY_DEST"
+    } else {
+        Write-Fail "dns_monitor.py exists but is empty: $PY_DEST"
+        $errors++
+    }
 } else {
     Write-Fail "dns_monitor.py   MISSING at $PY_DEST"
     $errors++
 }
 
 if (Test-Path $CONF_DEST) {
-    Write-OK "conf.yaml        $((Get-Item $CONF_DEST).Length) bytes  ->  $CONF_DEST"
+    $confSize = (Get-Item $CONF_DEST).Length
+    if ($confSize -gt 0) {
+        Write-OK "conf.yaml        $confSize bytes  ->  $CONF_DEST"
+    } else {
+        Write-Fail "conf.yaml exists but is empty: $CONF_DEST"
+        $errors++
+    }
 } else {
     Write-Fail "conf.yaml        MISSING at $CONF_DEST"
     $errors++
@@ -223,12 +254,20 @@ if ($errors -gt 0) {
 Write-Step "Restarting Datadog Agent"
 
 try {
-    Restart-Service -Name $DD_SERVICE -Force
+    Restart-Service -Name $DD_SERVICE -Force -ErrorAction Stop
     Start-Sleep -Seconds 8
-    Write-OK "Agent restarted -- status: $((Get-Service -Name $DD_SERVICE).Status)"
-} catch {
-    Write-Warn "Could not restart Agent automatically: $_"
-    Write-Warn "Run manually: Restart-Service $DD_SERVICE"
+
+    $svcAfter = Get-Service -Name $DD_SERVICE -ErrorAction Stop
+    if ($svcAfter.Status -ne 'Running') {
+        Write-Fail "Agent restart did not complete successfully. Current status: $($svcAfter.Status)"
+        exit 1
+    }
+
+    Write-OK "Agent restarted -- status: $($svcAfter.Status)"
+}
+catch {
+    Write-Fail "Could not restart Agent automatically: $_"
+    exit 1
 }
 
 # ==============================================================================
@@ -255,8 +294,38 @@ Write-Host "    zg.dns.forwarders.availability -> should be 1  per forwarder_ip"
 Write-Host ""
 
 # ==============================================================================
+# STEP 9 : Create success marker file
+# ==============================================================================
+Write-Step "Creating success marker file"
+
+try {
+    $successDir = Split-Path -Path $SUCCESS_FILE -Parent
+
+    if (-not (Test-Path $successDir)) {
+        New-Item -Path $successDir -ItemType Directory -Force | Out-Null
+        Write-OK "Created directory: $successDir"
+    }
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $content = @"
+Zoos Global DNS Monitor installation completed successfully.
+Host       : $env:COMPUTERNAME
+Time       : $timestamp
+Check file : $PY_DEST
+Conf file  : $CONF_DEST
+"@
+
+    Set-Content -Path $SUCCESS_FILE -Value $content -Encoding UTF8
+    Write-OK "Success marker created: $SUCCESS_FILE"
+}
+catch {
+    Write-Fail "Could not create success marker file: $_"
+    exit 1
+}
+
+# ==============================================================================
 Write-Host ""
 Write-Host "  Installation complete." -ForegroundColor Green
-Write-Host "  (c) Zoos Global | www.zoosglobal.com | shivam.anand@zoosglobal.com" -ForegroundColor Gray
+Write-Host "  (c) Zoos Global | https://www.zoosglobal.com | shivam.anand@zoosglobal.com" -ForegroundColor Gray
 Write-Host ""
 # ==============================================================================
